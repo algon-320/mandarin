@@ -1,0 +1,23 @@
+[env]
+TARGET_DIR = "./target/x86_64-unknown-uefi/release"
+
+[tasks.build]
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.efi]
+dependencies = ["build"]
+script = "cp ${TARGET_DIR}/bootloader.efi ./BOOTX64.EFI"
+
+[tasks.cargo-clean]
+command = "cargo"
+args = ["clean"]
+
+[tasks.remove-efi]
+ignore_errors = true
+command = "rm"
+args = ["./BOOTX64.EFI"]
+
+[tasks.clean]
+clear = true
+run_task = { name = ["cargo-clean", "remove-efi"] }
