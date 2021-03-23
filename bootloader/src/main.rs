@@ -2,6 +2,8 @@
 #![no_main]
 #![feature(llvm_asm)]
 
+mod elf;
+
 use uefi::prelude::ResultExt;
 
 use uefi::data_types::Handle;
@@ -13,7 +15,21 @@ use uefi::Status;
 
 use core::slice::from_raw_parts_mut;
 
-mod elf;
+#[repr(u8)]
+pub enum PixelFormat {
+    Rgb,
+    Bgr,
+    BitMask,
+    BltOnly,
+}
+#[repr(C)]
+pub struct FrameBuffer {
+    buffer: *mut u8,
+    resolution_horizontal: u64,
+    resolution_vertical: u64,
+    stride: u64,
+    format: PixelFormat,
+}
 
 // NOTE: x86_64-unknown-uefi target seems to assume that the entry point is exposed as "efi_main"
 #[no_mangle]
@@ -70,7 +86,7 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
         }
     }
 
-    use uefi::proto::console::gop::GraphicsOutput;
+    use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as PF};
     let gop = bs.locate_protocol::<GraphicsOutput>().unwrap_success();
     let gop = unsafe { &mut *gop.get() };
     let mode = gop.current_mode_info();
@@ -91,6 +107,18 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
         fb.size(),
     )
     .unwrap();
+    let frame_buffer = FrameBuffer {
+        buffer: fb.as_mut_ptr(),
+        resolution_horizontal: mode.resolution().0 as u64,
+        resolution_vertical: mode.resolution().1 as u64,
+        stride: mode.stride() as u64,
+        format: match mode.pixel_format() {
+            PF::Rgb => PixelFormat::Rgb,
+            PF::Bgr => PixelFormat::Bgr,
+            PF::Bitmask => PixelFormat::BitMask,
+            PF::BltOnly => PixelFormat::BltOnly,
+        },
+    };
 
     // Load the kernel
     let kernel: &mut [u8] = {
@@ -163,19 +191,18 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
         unsafe { from_raw_parts_mut(page_addr as *mut u8, kernel_size) }
     };
 
-    type EntryFn = fn() -> ();
+    type EntryFn = extern "sysv64" fn(FrameBuffer) -> ();
     let entry = {
         const ELF_ENTRY_OFFSET: usize = 24;
         let entry_addr = kernel.as_ptr().wrapping_add(ELF_ENTRY_OFFSET) as *const u64;
         unsafe { core::mem::transmute::<u64, EntryFn>(entry_addr.read()) }
     };
-    writeln!(system_table.stdout(), "entry = {:?}", entry).unwrap();
 
     let (_runtime, _desc_itr) = system_table
         .exit_boot_services(image_handle, &mut memmap_buf[..])
         .unwrap_success();
 
-    entry(); // kernel_main
+    entry(frame_buffer); // kernel_main
 
     #[allow(clippy::empty_loop)]
     loop {}

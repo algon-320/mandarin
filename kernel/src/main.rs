@@ -2,8 +2,27 @@
 #![no_main]
 #![feature(llvm_asm)]
 
+#[repr(u8)]
+pub enum PixelFormat {
+    Rgb,
+    Bgr,
+    BitMask,
+    BltOnly,
+}
+#[repr(C)]
+pub struct FrameBuffer {
+    buffer: *mut u8,
+    resolution_horizontal: u64,
+    resolution_vertical: u64,
+    stride: u64,
+    format: PixelFormat,
+}
+
 #[no_mangle]
-pub extern "C" fn kernel_main() {
+pub extern "C" fn kernel_main(mut frame_buffer: FrameBuffer) {
+    let h = frame_buffer.resolution_vertical as usize;
+    let w = frame_buffer.resolution_horizontal as usize;
+
     loop {
         x86_hlt();
     }
