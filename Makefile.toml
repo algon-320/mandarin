@@ -1,11 +1,21 @@
 [env]
 IMAGE = "disk.img"
 
-[tasks.mkimage]
-dependencies = [{ name = "efi", path = "bootloader" }]
-script_runner = "@shell"
+[tasks.run]
+dependencies = ["build-image", "prepare-ovmf"]
 script = '''
-rm "${IMAGE}" || true
+#!/usr/bin/env bash
+qemu-system-x86_64 \
+	-drive if=pflash,format=raw,file=./uefi-firmware/OVMF_CODE.fd \
+	-drive if=pflash,format=raw,file=./uefi-firmware/OVMF_VARS.fd \
+	-drive format=raw,media=disk,index=0,file=${IMAGE} \
+    -device isa-debug-exit
+'''
+
+[tasks.build-image]
+dependencies = [{ name = "copy-efi", path = "bootloader" }]
+script = '''
+#!/usr/bin/env bash
 qemu-img create -f raw "${IMAGE}" 200M
 mkfs.fat -n "MANDARIN OS" -s 2 -f 2 -F 32 -R 32 "${IMAGE}"
 mkdir -p ./mnt
@@ -15,19 +25,31 @@ sudo cp ./bootloader/BOOTX64.EFI ./mnt/EFI/BOOT/BOOTX64.EFI
 sudo umount ./mnt
 '''
 
-[tasks.run]
-dependencies = ["mkimage"]
-script_runner = "@shell"
+[tasks.prepare-ovmf.condition]
+files_not_exist = [
+  "${CARGO_MAKE_WORKING_DIRECTORY}/uefi-firmware/OVMF_CODE.fd",
+  "${CARGO_MAKE_WORKING_DIRECTORY}/uefi-firmware/OVMF_VARS.fd",
+]
+[tasks.prepare-ovmf]
 script = '''
-qemu-system-x86_64 \
-	-drive if=pflash,format=raw,file=./uefi-firmware/OVMF_CODE.fd \
-	-drive if=pflash,format=raw,file=./uefi-firmware/OVMF_VARS.fd \
-	-drive format=raw,media=disk,index=0,file=disk.img \
-    -device isa-debug-exit
+mkdir -p ./uefi-firmware
+cp /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_VARS.fd ./uefi-firmware/
 '''
 
+[tasks.check]
+dependencies = [{ name = "check", path = "bootloader" }]
+
 [tasks.clean]
-clear = true
-ignore_errors = true
 dependencies = [{ name = "clean", path = "bootloader" }]
-script = "rm ${IMAGE}"
+ignore_errors = true
+script = '''
+rm ${IMAGE}
+rm -r ./uefi-firmware
+'''
+
+
+[config]
+skip_core_tasks = true
+
+[tasks.default]
+alias = "run"
