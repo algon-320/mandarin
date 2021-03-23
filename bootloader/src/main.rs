@@ -5,15 +5,21 @@
 use uefi::prelude::ResultExt;
 
 use uefi::data_types::Handle;
-use uefi::proto::media::file::Directory;
-use uefi::table::boot::BootServices;
-use uefi::table::{Boot, SystemTable};
+use uefi::proto::media::file::{
+    Directory, File, FileAttribute, FileInfo, FileMode, FileType, RegularFile,
+};
+use uefi::table::{boot::BootServices, Boot, SystemTable};
 use uefi::Status;
+
+use core::slice::from_raw_parts_mut;
+
+mod elf;
 
 // NOTE: x86_64-unknown-uefi target seems to assume that the entry point is exposed as "efi_main"
 #[no_mangle]
 pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     use core::fmt::Write;
+
     writeln!(system_table.stdout(), "Hello, UEFI World!").unwrap();
     let bs = system_table.boot_services();
 
@@ -22,10 +28,6 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
     let (_map_key, desc_itr) = bs.memory_map(&mut memmap_buf).unwrap_success();
 
     let mut root = unsafe { open_root_dir(&bs, image_handle).unwrap_success() };
-
-    use uefi::proto::media::file::{
-        File, FileAttribute, FileInfo, FileMode, FileType, RegularFile,
-    };
 
     // Collect memory maps
     {
@@ -68,8 +70,33 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
         }
     }
 
+    use uefi::proto::console::gop::GraphicsOutput;
+    let gop = bs.locate_protocol::<GraphicsOutput>().unwrap_success();
+    let gop = unsafe { &mut *gop.get() };
+    let mode = gop.current_mode_info();
+    writeln!(
+        system_table.stdout(),
+        "Resolution (w, h): {:?}, Pixel Format: {:?}, {} px/line",
+        mode.resolution(),
+        mode.pixel_format(),
+        mode.stride(),
+    )
+    .unwrap();
+    let mut fb = gop.frame_buffer();
+    writeln!(
+        system_table.stdout(),
+        "Frame Buffer: {:p} - {:p} ({} bytes)",
+        fb.as_mut_ptr(),
+        fb.as_mut_ptr().wrapping_add(fb.size()),
+        fb.size(),
+    )
+    .unwrap();
+
     // Load the kernel
     let kernel: &mut [u8] = {
+        use uefi::data_types::Align;
+        use uefi::table::boot::{AllocateType, MemoryType};
+
         let kernel_elf = root
             .open("\\kernel.elf", FileMode::Read, FileAttribute::empty())
             .unwrap_success();
@@ -84,7 +111,6 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
         const BUF_REQUIRED: usize = 102;
         let mut buf = [0u8; BUF_REQUIRED];
 
-        use uefi::data_types::Align;
         assert!((buf.as_ptr() as usize) % FileInfo::alignment() == 0);
 
         let info: &FileInfo = kernel_elf
@@ -92,11 +118,35 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
             .unwrap_success();
         let file_size = info.file_size() as usize;
 
-        use uefi::table::boot::AllocateType;
-        use uefi::table::boot::MemoryType;
+        // allocate a temporal buffer
+        let kernel_buf: &mut [u8] = {
+            let tmp = bs
+                .allocate_pool(MemoryType::LOADER_DATA, file_size)
+                .unwrap_success();
+            unsafe { from_raw_parts_mut(tmp, file_size) }
+        };
+
+        let nb = kernel_elf.read(kernel_buf).unwrap_success();
+        assert_eq!(nb, file_size);
+
+        let kernel_ehdr: &elf::Elf64Ehdr = {
+            let ehdr = kernel_buf.as_ptr() as *const elf::Elf64Ehdr;
+            unsafe { &*ehdr }
+        };
+
+        let (kernel_begin, kernel_end) = kernel_ehdr.load_destination_range();
+        let kernel_size = kernel_end - kernel_begin;
+        writeln!(
+            system_table.stdout(),
+            "Kernel: {:p} - {:p}",
+            kernel_begin as *const u8,
+            kernel_end as *const u8,
+        )
+        .unwrap();
+
         const KERNEL_BASE_ADDR: usize = 0x100000;
         const PAGE_SIZE: usize = 0x1000;
-        let page_count = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let page_count = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
         let page_addr = bs
             .allocate_pages(
                 AllocateType::Address(KERNEL_BASE_ADDR),
@@ -104,33 +154,34 @@ pub extern "C" fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>
                 page_count,
             )
             .unwrap_success();
-        // this is safe since we own the page
-        let page: &mut [u8] = unsafe {
-            core::slice::from_raw_parts_mut(page_addr as *mut u8, page_count * PAGE_SIZE)
-        };
 
-        let nb = kernel_elf.read(page).unwrap_success();
-        assert_eq!(nb, file_size);
-        &mut page[..nb]
+        unsafe { kernel_ehdr.expand_load_segments() };
+
+        // free the buffer
+        bs.free_pool(kernel_buf.as_mut_ptr()).unwrap_success();
+
+        unsafe { from_raw_parts_mut(page_addr as *mut u8, kernel_size) }
     };
 
-    const ELF_ENTRY_OFFSET: isize = 24;
-    let entry_addr =
-        unsafe { core::ptr::read(kernel.as_ptr().offset(ELF_ENTRY_OFFSET) as *const u64) };
-    let entry = unsafe { core::mem::transmute::<u64, unsafe extern "C" fn()>(entry_addr) };
+    type EntryFn = fn() -> ();
+    let entry = {
+        const ELF_ENTRY_OFFSET: usize = 24;
+        let entry_addr = kernel.as_ptr().wrapping_add(ELF_ENTRY_OFFSET) as *const u64;
+        unsafe { core::mem::transmute::<u64, EntryFn>(entry_addr.read()) }
+    };
     writeln!(system_table.stdout(), "entry = {:?}", entry).unwrap();
 
     let (_runtime, _desc_itr) = system_table
         .exit_boot_services(image_handle, &mut memmap_buf[..])
         .unwrap_success();
 
-    unsafe { entry() };
+    entry(); // kernel_main
 
     #[allow(clippy::empty_loop)]
     loop {}
 }
 
-/// # Safety: this function must not be called by multiple-threads simultaneously.
+/// Safety: this function must not be called by multiple-threads simultaneously.
 unsafe fn open_root_dir(bs: &BootServices, image_handle: Handle) -> uefi::Result<Directory> {
     use uefi::proto::loaded_image::LoadedImage;
     use uefi::proto::media::fs::SimpleFileSystem;
