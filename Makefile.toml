@@ -2,18 +2,21 @@
 IMAGE = "disk.img"
 
 [tasks.run]
-dependencies = ["build-image", "prepare-ovmf"]
+dependencies = ["build", "prepare-ovmf"]
 script = '''
 #!/usr/bin/env bash
 qemu-system-x86_64 \
-	-drive if=pflash,format=raw,file=./uefi-firmware/OVMF_CODE.fd \
-	-drive if=pflash,format=raw,file=./uefi-firmware/OVMF_VARS.fd \
-	-drive format=raw,media=disk,index=0,file=${IMAGE} \
-    -device isa-debug-exit
+  -drive if=pflash,format=raw,file=./uefi-firmware/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=./uefi-firmware/OVMF_VARS.fd \
+  -drive format=raw,media=disk,index=0,file=${IMAGE} \
+  -device isa-debug-exit -monitor stdio
 '''
 
-[tasks.build-image]
-dependencies = [{ name = "copy-efi", path = "bootloader" }]
+[tasks.build]
+dependencies = [
+  { name = "copy-efi", path = "bootloader" },
+  { name = "build", path = "kernel" },
+]
 script = '''
 #!/usr/bin/env bash
 qemu-img create -f raw "${IMAGE}" 200M
@@ -22,6 +25,7 @@ mkdir -p ./mnt
 sudo mount -o loop "${IMAGE}" ./mnt
 sudo mkdir -p ./mnt/EFI/BOOT
 sudo cp ./bootloader/BOOTX64.EFI ./mnt/EFI/BOOT/BOOTX64.EFI
+sudo cp ./kernel/kernel.elf ./mnt/kernel.elf
 sudo umount ./mnt
 '''
 
@@ -37,19 +41,24 @@ cp /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_VARS.fd ./uefi-firmware/
 '''
 
 [tasks.check]
-dependencies = [{ name = "check", path = "bootloader" }]
+dependencies = [
+  { name = "check", path = "bootloader" },
+  { name = "check", path = "kernel" },
+]
 
 [tasks.clean]
-dependencies = [{ name = "clean", path = "bootloader" }]
+dependencies = [
+  { name = "clean", path = "bootloader" },
+  { name = "clean", path = "kernel" },
+]
 ignore_errors = true
 script = '''
 rm ${IMAGE}
 rm -r ./uefi-firmware
 '''
 
-
 [config]
 skip_core_tasks = true
 
 [tasks.default]
-alias = "run"
+alias = "build"

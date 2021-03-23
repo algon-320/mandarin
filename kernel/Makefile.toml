@@ -1,6 +1,3 @@
-[env]
-TARGET_DIR = "./target/x86_64-unknown-uefi/release"
-
 [tasks.build]
 command = "cargo"
 args = ["build", "--release"]
@@ -9,24 +6,20 @@ args = ["build", "--release"]
 command = "cargo"
 args = ["clippy"]
 
-[tasks.copy-efi]
-dependencies = ["build"]
-script = "cp ${TARGET_DIR}/bootloader.efi ./BOOTX64.EFI"
-
 [tasks.clean]
-dependencies = ["cargo-clean", "remove-efi"]
+dependencies = ["cargo-clean", "remove-elf"]
 
 [tasks.cargo-clean]
 command = "cargo"
 args = ["clean"]
 
-[tasks.remove-efi]
+[tasks.remove-elf]
 ignore_errors = true
 command = "rm"
-args = ["./BOOTX64.EFI"]
+args = ["./kernel.elf"]
 
 [config]
 skip_core_tasks = true
 
 [tasks.default]
-alias = "copy-efi"
+alias = "build"
