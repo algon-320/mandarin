@@ -1,22 +1,18 @@
 [tasks.build]
-command = "cargo"
-args = ["build", "--release"]
+script = "cargo build --release"
 
 [tasks.check]
-command = "cargo"
-args = ["clippy"]
+script = "cargo clippy"
 
 [tasks.clean]
 dependencies = ["cargo-clean", "remove-elf"]
 
 [tasks.cargo-clean]
-command = "cargo"
-args = ["clean"]
+script = "cargo clean"
 
 [tasks.remove-elf]
 ignore_errors = true
-command = "rm"
-args = ["./kernel.elf"]
+script = "rm ./kernel.elf"
 
 [config]
 skip_core_tasks = true
