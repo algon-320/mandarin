@@ -54,9 +54,9 @@ impl Color {
 }
 
 trait PixelWriter {
-    fn write_pixel(&mut self, x: usize, y: usize, c: Color);
+    fn write_pixel(&mut self, x: isize, y: isize, c: Color);
 
-    fn write_rect(&mut self, x: usize, y: usize, w: usize, h: usize, c: Color) {
+    fn write_rect(&mut self, x: isize, y: isize, w: isize, h: isize, c: Color) {
         for iy in 0..h {
             for ix in 0..w {
                 self.write_pixel(x + ix, y + iy, c);
@@ -64,7 +64,7 @@ trait PixelWriter {
         }
     }
 
-    fn write_char(&mut self, x: usize, y: usize, c: Color, ch: char) {
+    fn write_char(&mut self, x: isize, y: isize, c: Color, ch: char) {
         const SHINONOME_FONT: &[u8] = include_bytes!("../assets/hankaku.bin");
         let mut ch = ch as usize;
         if SHINONOME_FONT.len() < ch {
@@ -74,12 +74,12 @@ trait PixelWriter {
             let row = SHINONOME_FONT[ch * 16 + iy];
             for ix in 0..8 {
                 if row & (0x80 >> ix) != 0 {
-                    self.write_pixel(x + ix, y + iy, c);
+                    self.write_pixel(x + ix as isize, y + iy as isize, c);
                 }
             }
         }
     }
-    fn write_str(&mut self, x: usize, y: usize, color: Color, s: &str) {
+    fn write_str(&mut self, x: isize, y: isize, color: Color, s: &str) {
         let mut ix = 0;
         for c in s.chars() {
             self.write_char(x + ix, y, color, c);
@@ -89,7 +89,17 @@ trait PixelWriter {
 }
 
 impl PixelWriter for FrameBuffer {
-    fn write_pixel(&mut self, x: usize, y: usize, Color { r, g, b }: Color) {
+    fn write_pixel(&mut self, x: isize, y: isize, Color { r, g, b }: Color) {
+        // check valid point
+        {
+            let w = self.resolution_horizontal as isize;
+            let h = self.resolution_vertical as isize;
+            if !(0 <= x && x < w && 0 <= y && y < h) {
+                return;
+            }
+        }
+        let (x, y) = (x as usize, y as usize);
+
         let idx = self.stride as usize * y + x;
         let p = unsafe { self.buffer.add(4 * idx) };
         let data: [u8; 4] = match self.format {
@@ -103,10 +113,13 @@ impl PixelWriter for FrameBuffer {
     }
 }
 
+use crate::sync::spin::SpinMutex;
+static CONSOLE: SpinMutex<i32> = SpinMutex::new("console", 123);
+
 #[no_mangle]
 pub extern "C" fn kernel_main(mut frame_buffer: FrameBuffer) {
-    let h = frame_buffer.resolution_vertical as usize;
-    let w = frame_buffer.resolution_horizontal as usize;
+    let h = frame_buffer.resolution_vertical as isize;
+    let w = frame_buffer.resolution_horizontal as isize;
 
     frame_buffer.write_rect(0, 0, w, h, Color::WHITE);
     frame_buffer.write_str(50, 50, Color::BLACK, "Hello, World!");
