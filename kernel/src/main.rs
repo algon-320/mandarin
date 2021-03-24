@@ -2,128 +2,32 @@
 #![no_main]
 #![feature(llvm_asm)]
 
-#[repr(u8)]
-pub enum PixelFormat {
-    Rgb,
-    Bgr,
-    BitMask,
-    BltOnly,
-}
-#[repr(C)]
-pub struct FrameBuffer {
-    buffer: *mut u8,
-    resolution_horizontal: u64,
-    resolution_vertical: u64,
-    stride: u64,
-    format: PixelFormat,
-}
+mod console;
+mod global;
+mod graphics;
+mod sync;
 
-#[derive(Clone, Copy)]
-pub struct Color {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-#[allow(dead_code)]
-impl Color {
-    const WHITE: Self = Self {
-        r: 0xFF,
-        g: 0xFF,
-        b: 0xFF,
-    };
-    const BLACK: Self = Self {
-        r: 0x00,
-        g: 0x00,
-        b: 0x00,
-    };
-    const RED: Self = Self {
-        r: 0xFF,
-        g: 0x00,
-        b: 0x00,
-    };
-    const GREEN: Self = Self {
-        r: 0x00,
-        g: 0xFF,
-        b: 0x00,
-    };
-    const BLUE: Self = Self {
-        r: 0x00,
-        g: 0x00,
-        b: 0xFF,
-    };
-}
-
-trait PixelWriter {
-    fn write_pixel(&mut self, x: isize, y: isize, c: Color);
-
-    fn write_rect(&mut self, x: isize, y: isize, w: isize, h: isize, c: Color) {
-        for iy in 0..h {
-            for ix in 0..w {
-                self.write_pixel(x + ix, y + iy, c);
-            }
-        }
-    }
-
-    fn write_char(&mut self, x: isize, y: isize, c: Color, ch: char) {
-        const SHINONOME_FONT: &[u8] = include_bytes!("../assets/hankaku.bin");
-        let mut ch = ch as usize;
-        if SHINONOME_FONT.len() < ch {
-            ch = b'?' as usize;
-        }
-        for iy in 0..16 {
-            let row = SHINONOME_FONT[ch * 16 + iy];
-            for ix in 0..8 {
-                if row & (0x80 >> ix) != 0 {
-                    self.write_pixel(x + ix as isize, y + iy as isize, c);
-                }
-            }
-        }
-    }
-    fn write_str(&mut self, x: isize, y: isize, color: Color, s: &str) {
-        let mut ix = 0;
-        for c in s.chars() {
-            self.write_char(x + ix, y, color, c);
-            ix += 10;
-        }
-    }
-}
-
-impl PixelWriter for FrameBuffer {
-    fn write_pixel(&mut self, x: isize, y: isize, Color { r, g, b }: Color) {
-        // check valid point
-        {
-            let w = self.resolution_horizontal as isize;
-            let h = self.resolution_vertical as isize;
-            if !(0 <= x && x < w && 0 <= y && y < h) {
-                return;
-            }
-        }
-        let (x, y) = (x as usize, y as usize);
-
-        let idx = self.stride as usize * y + x;
-        let p = unsafe { self.buffer.add(4 * idx) };
-        let data: [u8; 4] = match self.format {
-            PixelFormat::Rgb => [r, g, b, 0],
-            PixelFormat::Bgr => [b, g, r, 0],
-            _ => unimplemented!(),
-        };
-        for (i, &v) in data.iter().enumerate() {
-            unsafe { p.add(i).write_volatile(v) };
-        }
-    }
-}
-
-use crate::sync::spin::SpinMutex;
-static CONSOLE: SpinMutex<i32> = SpinMutex::new("console", 123);
+use crate::graphics::{font, Color, FrameBuffer};
 
 #[no_mangle]
-pub extern "C" fn kernel_main(mut frame_buffer: FrameBuffer) {
-    let h = frame_buffer.resolution_vertical as isize;
-    let w = frame_buffer.resolution_horizontal as isize;
+pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
+    let w = frame_buffer.width();
+    let h = frame_buffer.height();
+    global::init_frame_buffer(frame_buffer);
 
-    frame_buffer.write_rect(0, 0, w, h, Color::WHITE);
-    frame_buffer.write_str(50, 50, Color::BLACK, "Hello, World!");
-    frame_buffer.write_str(50, 70, Color::RED, "Written in pure Rust (so far)");
+    use graphics::Render;
+    global::lock_frame_buffer(|fb| fb.draw_filled_rect(0, 0, w, h, Color::BLACK));
+
+    use font::Font;
+    let (cw, ch) = font::ShinonomeFont.char_size(' ');
+    let columns = (w / cw) as usize;
+    let lines = (h / ch) as usize;
+    global::init_console(columns, lines);
+
+    println!("Hello, World");
+    println!();
+    println!("---- intentional panic ----");
+    assert_eq!(1 + 1, 3);
 
     loop {
         x86_hlt();
@@ -132,8 +36,9 @@ pub extern "C" fn kernel_main(mut frame_buffer: FrameBuffer) {
 
 #[panic_handler]
 #[no_mangle]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    x86_outw(0x0501, 0x0001); // exit QEMU with exit status 3 (= 0x01*2+1)
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    errorln!("{}", info);
+    // x86_outw(0x0501, 0x0001); // exit QEMU with exit status 3 (= 0x01*2+1)
     loop {
         x86_hlt();
     }
@@ -145,6 +50,7 @@ fn x86_hlt() {
 }
 
 /// write the word (data) to the port
+#[allow(dead_code)]
 fn x86_outw(port: u16, data: u16) {
     unsafe { llvm_asm!("outw $0, $1" :: "{ax}"(data), "{dx}"(port) :: "volatile") };
 }
