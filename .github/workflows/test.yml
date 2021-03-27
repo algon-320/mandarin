@@ -1,0 +1,31 @@
+name: Test on QEMU
+on: [push, pull_request]
+
+jobs:
+  test-on-qemu:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: install rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+        override: true
+        components: rust-src
+
+    - name: install cargo-make
+      uses: actions-rs/install@v0.1
+      with:
+        crate: cargo-make
+        version: latest
+        use-tool-cache: true
+
+    - run: sudo apt-get update
+    - name: install QEMU
+      run: sudo apt-get install qemu-system-x86
+    - name: install lld
+      run: sudo apt-get install lld
+
+    - name: testing on QEMU
+      run: cargo make test

@@ -11,15 +11,15 @@ dependencies = [
 
 
 [tasks.run]
-env = { "MAKE_PROFILE" = "release" }
+env = { "MAKE_PROFILE" = "release", QEMU_OPTS = "-monitor stdio" }
 run_task = "qemu"
 
 [tasks.debug]
-env = { "MAKE_PROFILE" = "debug", QEMU_OPTS = "-S -gdb tcp::${GDB_PORT}" }
+env = { "MAKE_PROFILE" = "debug", QEMU_OPTS = "-monitor stdio -S -gdb tcp::${GDB_PORT}" }
 run_task = "qemu"
 
 [tasks.test]
-env = { "MAKE_PROFILE" = "test" }
+env = { "MAKE_PROFILE" = "test", QEMU_OPTS = "-monitor none -display none" }
 run_task = "qemu"
 
 [tasks.gdb-attach]
@@ -34,7 +34,7 @@ qemu-system-x86_64 \
   -drive if=pflash,format=raw,file=./uefi-firmware/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file=./uefi-firmware/OVMF_VARS.fd \
   -drive format=raw,media=disk,index=0,file=${IMAGE} \
-  -device isa-debug-exit -monitor stdio ${QEMU_OPTS}
+  -device isa-debug-exit ${QEMU_OPTS}
 '''
 
 
