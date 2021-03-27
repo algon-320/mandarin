@@ -1,5 +1,16 @@
 [tasks.build]
-script = "cargo build --release"
+script = '''
+#!/usr/bin/env bash
+echo ${MAKE_PROFILE}
+case ${MAKE_PROFILE} in
+    "release")
+        cargo build --release ;;
+    "test")
+        cargo test --no-run ;;
+    *)
+        cargo build ;;
+esac
+'''
 
 [tasks.check]
 script = "cargo clippy"

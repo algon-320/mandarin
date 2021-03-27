@@ -1,5 +1,6 @@
 [env]
 IMAGE = "disk.img"
+GDB_PORT = "12345"
 
 
 [tasks.build]
@@ -10,13 +11,30 @@ dependencies = [
 
 
 [tasks.run]
+env = { "MAKE_PROFILE" = "release" }
+run_task = "qemu"
+
+[tasks.debug]
+env = { "MAKE_PROFILE" = "debug", QEMU_OPTS = "-S -gdb tcp::${GDB_PORT}" }
+run_task = "qemu"
+
+[tasks.test]
+env = { "MAKE_PROFILE" = "test" }
+run_task = "qemu"
+
+[tasks.gdb-attach]
+script = '''
+gdb kernel/kernel.elf -ex "target remote localhost:${GDB_PORT}"
+'''
+
+[tasks.qemu]
 dependencies = ["build-disk", "prepare-ovmf"]
 script = '''
 qemu-system-x86_64 \
   -drive if=pflash,format=raw,file=./uefi-firmware/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file=./uefi-firmware/OVMF_VARS.fd \
   -drive format=raw,media=disk,index=0,file=${IMAGE} \
-  -device isa-debug-exit -monitor stdio
+  -device isa-debug-exit -monitor stdio ${QEMU_OPTS}
 '''
 
 

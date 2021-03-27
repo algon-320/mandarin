@@ -1,11 +1,71 @@
 #![no_std]
 #![no_main]
-#![feature(llvm_asm)]
+#![feature(asm)]
+#![feature(custom_test_frameworks)]
+#![test_runner(test_runner)]
+#![reexport_test_harness_main = "test_main"]
 
 mod console;
 mod global;
 mod graphics;
 mod sync;
+
+mod x86 {
+    /// halt the CPU
+    pub fn hlt() {
+        unsafe { asm!("hlt") };
+    }
+
+    #[inline]
+    pub fn out16(port: u16, data: u16) {
+        unsafe {
+            asm!(
+                "out dx, ax",
+                in("dx") port,
+                in("ax") data,
+                options(nomem, nostack)
+            )
+        };
+    }
+    #[inline]
+    pub fn in16(port: u16) -> u16 {
+        let ax: u16;
+        unsafe {
+            asm!(
+                "in ax, dx",
+                out("ax") ax,
+                in("dx") port,
+                options(nomem, nostack)
+            )
+        };
+        ax
+    }
+
+    #[inline]
+    pub fn out32(port: u16, data: u32) {
+        unsafe {
+            asm!(
+                "out dx, eax",
+                in("dx") port,
+                in("eax") data,
+                options(nomem, nostack)
+            )
+        };
+    }
+    #[inline]
+    pub fn in32(port: u16) -> u32 {
+        let eax: u32;
+        unsafe {
+            asm!(
+                "in eax, dx",
+                out("eax") eax,
+                in("dx") port,
+                options(nomem, nostack)
+            )
+        };
+        eax
+    }
+}
 
 use crate::graphics::{font, Color, FrameBuffer};
 
@@ -24,33 +84,56 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
     let lines = (h / ch) as usize;
     global::init_console(columns, lines);
 
+    #[cfg(test)]
+    test_main();
+
     println!("Hello, World");
     println!();
     println!("---- intentional panic ----");
     assert_eq!(1 + 1, 3);
 
     loop {
-        x86_hlt();
+        x86::hlt();
     }
 }
 
 #[panic_handler]
 #[no_mangle]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    #[cfg(test)]
+    x86::out16(0x501, 0x01); // exit QEMU with status 3
+
     errorln!("{}", info);
-    // x86_outw(0x0501, 0x0001); // exit QEMU with exit status 3 (= 0x01*2+1)
     loop {
-        x86_hlt();
+        x86::hlt();
     }
 }
 
-/// halt the CPU
-fn x86_hlt() {
-    unsafe { llvm_asm!("hlt") };
+#[cfg(test)]
+fn test_runner(tests: &[&dyn TestCaseFn]) {
+    println!("Running {} tests", tests.len());
+    for test in tests {
+        test.run_test();
+    }
+    println!("all tests passed!");
+    x86::out16(0xB004, 0x2000); // exit QEMU with status 0
+}
+#[cfg(test)]
+trait TestCaseFn {
+    fn run_test(&self);
+}
+#[cfg(test)]
+impl<T: Fn()> TestCaseFn for T {
+    fn run_test(&self) {
+        print!("{} ... ", core::any::type_name::<T>());
+        self();
+        println!("ok!");
+    }
 }
 
-/// write the word (data) to the port
-#[allow(dead_code)]
-fn x86_outw(port: u16, data: u16) {
-    unsafe { llvm_asm!("outw $0, $1" :: "{ax}"(data), "{dx}"(port) :: "volatile") };
+#[cfg(test)]
+#[test_case]
+fn trivial_test() {
+    assert_eq!(1 + 1, 2);
+    assert_ne!(1 + 1, '田' as u32);
 }
