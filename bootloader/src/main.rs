@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(llvm_asm)]
+#![feature(asm)]
 
 mod elf;
 
@@ -228,5 +228,12 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 /// write the word (data) to the port
 fn x86_outw(port: u16, data: u16) {
-    unsafe { llvm_asm!("outw $0, $1" :: "{ax}"(data), "{dx}"(port) :: "volatile") };
+    unsafe {
+        asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") data,
+            options(nomem, nostack)
+        )
+    };
 }
