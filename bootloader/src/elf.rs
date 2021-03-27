@@ -88,9 +88,10 @@ impl Elf64Ehdr {
             let elf_begin = self as *const _ as *const u8;
             let offset = elf_begin.wrapping_add(phdr.p_offset as usize);
             let filesz = phdr.p_filesz as usize;
-            copy_nonoverlapping(offset, phdr.p_vaddr as *mut u8, filesz);
+            let dst = phdr.p_vaddr as *mut u8;
+            copy_nonoverlapping(offset, dst, filesz);
             let remain = (phdr.p_memsz - phdr.p_filesz) as usize;
-            core::ptr::write_bytes(phdr.p_vaddr as *mut u8, 0, remain);
+            core::ptr::write_bytes(dst.add(filesz), 0, remain);
         }
     }
 }
