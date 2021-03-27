@@ -8,7 +8,9 @@
 mod console;
 mod global;
 mod graphics;
+mod pci;
 mod sync;
+mod utils;
 mod x86;
 
 use crate::graphics::{font, Color, FrameBuffer};
@@ -33,8 +35,13 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
 
     println!("Hello, World");
     println!();
-    println!("---- intentional panic ----");
-    assert_eq!(1 + 1, 3);
+
+    let scan_result = unsafe { pci::scan_all_buses() };
+    println!("scan_all_buses: {:?}", scan_result);
+
+    for dev in pci::devices().iter() {
+        println!("{:?}", dev);
+    }
 
     loop {
         x86::hlt();
