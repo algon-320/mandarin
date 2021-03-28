@@ -40,3 +40,7 @@ on another terminal.
 ```
 $ cargo make test
 ```
+or to show test messages:
+```
+$ cargo make test-console
+```

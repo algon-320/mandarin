@@ -7,6 +7,8 @@ case ${MAKE_PROFILE} in
         cargo build --release ;;
     "test")
         cargo test --no-run ;;
+    "test-console")
+        cargo test --features="test_console" --no-run ;;
     *)
         cargo build ;;
 esac

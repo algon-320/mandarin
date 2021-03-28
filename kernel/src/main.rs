@@ -52,7 +52,7 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
 #[panic_handler]
 #[no_mangle]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "test_console")))]
     x86::out16(0x501, 0x01); // exit QEMU with status 3
 
     error!("{}", info);
@@ -68,7 +68,11 @@ fn test_runner(tests: &[&dyn TestCaseFn]) {
         test.run_test();
     }
     println!("all tests passed!");
+    #[cfg(not(feature = "test_console"))]
     x86::out16(0xB004, 0x2000); // exit QEMU with status 0
+    loop {
+        x86::hlt();
+    }
 }
 #[cfg(test)]
 trait TestCaseFn {

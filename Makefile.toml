@@ -22,6 +22,10 @@ run_task = "qemu"
 env = { "MAKE_PROFILE" = "test", QEMU_OPTS = "-monitor none -display none" }
 run_task = "qemu"
 
+[tasks.test-console]
+env = { "MAKE_PROFILE" = "test-console", QEMU_OPTS = "-monitor stdio" }
+run_task = "qemu"
+
 [tasks.gdb-attach]
 script = '''
 gdb kernel/kernel.elf -ex "target remote localhost:${GDB_PORT}"
