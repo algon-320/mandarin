@@ -12,6 +12,10 @@ a hobby OS for x86_64 based on [MikanOS](https://github.com/uchan-nos/mikanos).
 - cargo
 - cargo-make
 
+## Dependencies
+
+- [uefi-rs](https://github.com/rust-osdev/uefi-rs)
+
 ## Build image
 ```
 $ cargo make build-disk
