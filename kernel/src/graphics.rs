@@ -31,9 +31,9 @@ impl FrameBuffer {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Color {
-    r: u8,
-    g: u8,
-    b: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 #[allow(dead_code)]
 impl Color {

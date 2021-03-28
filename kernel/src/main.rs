@@ -5,6 +5,7 @@
 #![test_runner(test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+#[macro_use]
 mod console;
 mod global;
 mod graphics;
@@ -37,10 +38,10 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
     println!();
 
     let scan_result = unsafe { pci::scan_all_buses() };
-    println!("scan_all_buses: {:?}", scan_result);
+    debug!("scan_all_buses: {:?}", scan_result);
 
     for dev in pci::devices().iter() {
-        println!("{:?}", dev);
+        trace!("{:?}", dev);
     }
 
     loop {
@@ -54,7 +55,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     #[cfg(test)]
     x86::out16(0x501, 0x01); // exit QEMU with status 3
 
-    errorln!("{}", info);
+    error!("{}", info);
     loop {
         x86::hlt();
     }

@@ -129,7 +129,6 @@ macro_rules! print {
         $crate::global::console_write(Attribute::DEFAULT, format_args!($($arg)*));
     }};
 }
-
 #[macro_export]
 macro_rules! println {
     () => { $crate::print!("\n") };
@@ -137,16 +136,67 @@ macro_rules! println {
 }
 
 #[macro_export]
+macro_rules! trace {
+    ($($arg:tt)*) => {{
+        use $crate::console::Attribute;
+        use $crate::graphics::Color;
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("["));
+        let attr = Attribute { fg: Color { r: 64, g: 126, b: 231 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("TRACE"));
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+    }};
+}
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {{
+        use $crate::console::Attribute;
+        use $crate::graphics::Color;
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("["));
+        let attr = Attribute { fg: Color { r: 123, g: 151, b: 38 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("DEBUG"));
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+    }};
+}
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        use $crate::console::Attribute;
+        use $crate::graphics::Color;
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("["));
+        let attr = Attribute { fg: Color { r: 61, g: 151, b: 184 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("INFO"));
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+    }};
+}
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)*) => {{
+        use $crate::console::Attribute;
+        use $crate::graphics::Color;
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("["));
+        let attr = Attribute { fg: Color { r: 195, g: 132, b: 24 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("WARN"));
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+    }};
+}
+#[macro_export]
 macro_rules! error {
     ($($arg:tt)*) => {{
         use $crate::console::Attribute;
-        let attr = Attribute { fg: Color::RED, bg: Color::BLACK };
-        $crate::global::console_write(attr, format_args!($($arg)*));
+        use $crate::graphics::Color;
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("["));
+        let attr = Attribute { fg: Color { r: 242, g: 44, b: 64 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("ERROR"));
+        let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
+        $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
     }};
-}
-
-#[macro_export]
-macro_rules! errorln {
-    () => { $crate::error!("\n") };
-    ($($arg:tt)*) => { $crate::error!("{}\n", format_args!($($arg)*)) };
 }
