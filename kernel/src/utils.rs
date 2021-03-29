@@ -20,7 +20,7 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
             initialized: false,
         }
     }
-    pub fn initialize(&mut self) {
+    pub fn ensure_initialized(&mut self) {
         if self.initialized {
             return;
         }
@@ -37,6 +37,8 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
     }
 
     pub fn alloc(&mut self, size: usize, align: usize, boundary: usize) -> Option<NonNull<u8>> {
+        self.ensure_initialized();
+
         let mut ptr = Self::ceil(self.ptr, align);
         let next_boundary = Self::ceil(self.ptr, boundary);
         if next_boundary < ptr + size {
@@ -45,6 +47,7 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
         if self.end < ptr + size {
             None
         } else {
+            trace!("memory allocated: start={:#x}, size={:#x}", ptr, size);
             self.ptr = ptr + size;
             Some(unsafe { NonNull::new_unchecked(ptr as *mut u8) })
         }
@@ -61,9 +64,31 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
             ))
         })
     }
+    pub fn alloc_slice_ext<T>(
+        &mut self,
+        len: usize,
+        align: usize,
+        boundary: usize,
+    ) -> Option<NonNull<[MaybeUninit<T>]>> {
+        let ptr = self.alloc(size_of::<T>() * len, align, boundary)?;
+        Some(unsafe {
+            NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+                ptr.as_ptr() as *mut MaybeUninit<T>,
+                len,
+            ))
+        })
+    }
 
     pub fn alloc_obj<T>(&mut self) -> Option<NonNull<MaybeUninit<T>>> {
         let ptr = self.alloc(size_of::<T>(), align_of::<T>(), Self::PAGE_BOUNDARY)?;
+        Some(unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut MaybeUninit<T>) })
+    }
+    pub fn alloc_obj_ext<T>(
+        &mut self,
+        align: usize,
+        boundary: usize,
+    ) -> Option<NonNull<MaybeUninit<T>>> {
+        let ptr = self.alloc(size_of::<T>(), align, boundary)?;
         Some(unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut MaybeUninit<T>) })
     }
 }
@@ -192,7 +217,6 @@ mod malloc_tests {
         const BUF_SIZE: usize = 1024 * 4;
         static mut MALLOC: StaticMallocator<BUF_SIZE> = StaticMallocator::new();
         unsafe {
-            MALLOC.initialize();
             let buf_ptr = MALLOC.buf.as_mut_ptr() as usize;
 
             let ptr = MALLOC.alloc_obj::<u8>();
@@ -228,7 +252,6 @@ mod malloc_tests {
         const BUF_SIZE: usize = 1024 * 4;
         static mut MALLOC: StaticMallocator<BUF_SIZE> = StaticMallocator::new();
         unsafe {
-            MALLOC.initialize();
             let buf_ptr = MALLOC.buf.as_mut_ptr() as usize;
 
             let ptr = MALLOC.alloc(1, 1, 1024);

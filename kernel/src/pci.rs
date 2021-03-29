@@ -1,12 +1,16 @@
 #[derive(Debug)]
 pub enum Error {
     Full,
+    IndexOutOfRange,
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Full => {
                 write!(f, "More than 32 devices found")
+            }
+            Self::IndexOutOfRange => {
+                write!(f, "Index out of range")
             }
         }
     }
@@ -32,13 +36,13 @@ fn read_data() -> u32 {
 }
 
 #[derive(Clone, Copy)]
-struct Config {
+pub struct Config {
     pub bus: u8,
     pub device: u8,
     pub function: u8,
 }
 impl Config {
-    fn make_addr(&self, reg_idx: u8) -> u32 {
+    pub fn make_addr(&self, reg_idx: u8) -> u32 {
         let enable = 1;
         fn shl(x: u8, w: u32) -> u32 {
             let (r, of) = (x as u32).overflowing_shl(w);
@@ -54,7 +58,7 @@ impl Config {
             | shl(reg_addr, 0)
     }
 
-    fn read_vendor_id(&self) -> u16 {
+    pub fn read_vendor_id(&self) -> u16 {
         write_addr(self.make_addr(0));
         (read_data() & 0x0000FFFF) as u16
     }
@@ -65,14 +69,14 @@ impl Config {
     }
 
     /// (Base Class, Sub Class, Interface, Revision ID)
-    fn read_class_code(&self) -> (u8, u8, u8, u8) {
+    pub fn read_class_code(&self) -> (u8, u8, u8, u8) {
         write_addr(self.make_addr(2));
         let code = read_data() as u32;
         let base = ((code & 0xFF000000) >> 24) as u8;
         let sub_ = ((code & 0x00FF0000) >> 16) as u8;
-        let intf = ((code & 0x0000FF00) >> 8) as u8;
-        let revi = ((code & 0x000000FF) >> 0) as u8;
-        (base, sub_, intf, revi)
+        let ifce = ((code & 0x0000FF00) >> 8) as u8;
+        let rvid = ((code & 0x000000FF) >> 0) as u8;
+        (base, sub_, ifce, rvid)
     }
 
     fn read_header_type(&self) -> u8 {
@@ -109,12 +113,43 @@ impl From<Config> for Device {
     }
 }
 impl Device {
-    fn as_config(&self) -> Config {
+    pub fn as_config(&self) -> Config {
         Config {
             bus: self.bus,
             device: self.device,
             function: self.function,
         }
+    }
+
+    pub fn read_register(&self, reg_idx: u8) -> u32 {
+        write_addr(self.as_config().make_addr(reg_idx));
+        read_data()
+    }
+    pub fn write_register(&self, reg_idx: u8, value: u32) {
+        write_addr(self.as_config().make_addr(reg_idx));
+        write_data(value);
+    }
+
+    pub fn read_bar(&self, bar_idx: u8) -> Result<u64> {
+        if bar_idx >= 6 {
+            return Err(Error::IndexOutOfRange);
+        }
+
+        const BAR_OFFSET: u8 = 4;
+        let bar = self.read_register(BAR_OFFSET + bar_idx);
+
+        // 32-bit address
+        if bar & 0b100 == 0 {
+            return Ok(bar as u64);
+        }
+
+        // 64-bit address
+        if bar_idx >= 5 {
+            return Err(Error::IndexOutOfRange);
+        }
+
+        let bar_upper = self.read_register(BAR_OFFSET + bar_idx + 1);
+        Ok(((bar_upper as u64) << 32) | bar as u64)
     }
 }
 impl core::fmt::Debug for Device {
