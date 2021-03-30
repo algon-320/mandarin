@@ -23,7 +23,8 @@ $ cargo make build-disk
 
 ## Run with QEMU
 ```
-$ cargo make run
+$ cargo make run      # release mode
+$ cargo make run-dev  # dev mode
 ```
 
 ## Debug with GDB
@@ -38,9 +39,6 @@ on another terminal.
 
 ## Test on QEMU
 ```
-$ cargo make test
-```
-or to show test messages:
-```
-$ cargo make test-console
+$ cargo make test  # without display
+$ cargo make test-console  # with display
 ```
