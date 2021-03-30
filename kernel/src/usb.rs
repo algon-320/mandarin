@@ -102,16 +102,16 @@ pub mod xhci {
             data: u64,
         }
         impl Crcr {
-            getter!(data: u64; 0x0000000000000001; u64, pub ring_cycle_state);
-            setter!(data: u64; 0x0000000000000001; u64, pub set_ring_cycle_state);
+            getter!(data: u64; 0x0000000000000001; u8, pub ring_cycle_state);
+            setter!(data: u64; 0x0000000000000001; u8, pub set_ring_cycle_state);
 
             // RW1S
-            getter!(data: u64; 0x0000000000000002; u64, pub command_stop);
-            setter!(data: u64; 0x0000000000000002; u64, pub set_command_stop);
+            getter!(data: u64; 0x0000000000000002; u8, pub command_stop);
+            setter!(data: u64; 0x0000000000000002; u8, pub set_command_stop);
 
             // RW1S
-            getter!(data: u64; 0x0000000000000004; u64, pub command_abort);
-            setter!(data: u64; 0x0000000000000004; u64, pub set_command_abort);
+            getter!(data: u64; 0x0000000000000004; u8, pub command_abort);
+            setter!(data: u64; 0x0000000000000004; u8, pub set_command_abort);
 
             getter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, command_ring_pointer);
             setter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, set_command_ring_pointer);
