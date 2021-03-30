@@ -28,6 +28,7 @@ impl Cell {
         attr: Attribute::DEFAULT,
     };
 }
+
 #[derive(Debug)]
 pub struct Console {
     columns: usize,
@@ -97,10 +98,17 @@ impl Console {
         }
     }
 
-    pub fn render<R: Render, F: Font>(&self, renderer: &mut R, font: &mut F) {
+    pub fn render<R: Render, F: Font>(&mut self, renderer: &mut R, font: &mut F) {
         let (char_w, char_h) = font.char_size('M');
         for line in 0..self.lines {
             for col in 0..self.columns {
+                renderer.draw_filled_rect(
+                    col as isize * char_w,
+                    line as isize * char_h,
+                    char_w,
+                    char_h,
+                    self.attr.bg,
+                );
                 let idx = line * self.columns + col;
                 if let Cell { ch: Some(ch), attr } = self.cells[idx] {
                     let x = char_w * col as isize;
@@ -127,6 +135,7 @@ macro_rules! print {
     ($($arg:tt)*) => {{
         use $crate::console::Attribute;
         $crate::global::console_write(Attribute::DEFAULT, format_args!($($arg)*));
+        $crate::global::console_flush();
     }};
 }
 #[macro_export]
@@ -146,6 +155,7 @@ macro_rules! trace {
         $crate::global::console_write(attr, format_args!("TRACE"));
         let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
         $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+        $crate::global::console_flush();
     }};
 }
 #[macro_export]
@@ -159,6 +169,7 @@ macro_rules! debug {
         $crate::global::console_write(attr, format_args!("DEBUG"));
         let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
         $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+        $crate::global::console_flush();
     }};
 }
 #[macro_export]
@@ -172,6 +183,7 @@ macro_rules! info {
         $crate::global::console_write(attr, format_args!("INFO"));
         let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
         $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+        $crate::global::console_flush();
     }};
 }
 #[macro_export]
@@ -185,6 +197,7 @@ macro_rules! warn {
         $crate::global::console_write(attr, format_args!("WARN"));
         let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
         $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+        $crate::global::console_flush();
     }};
 }
 #[macro_export]
@@ -198,5 +211,6 @@ macro_rules! error {
         $crate::global::console_write(attr, format_args!("ERROR"));
         let attr = Attribute { fg: Color { r: 168, g: 161, b: 159 }, bg: Color::BLACK };
         $crate::global::console_write(attr, format_args!("] {}\n", format_args!($($arg)*)));
+        $crate::global::console_flush();
     }};
 }

@@ -31,6 +31,9 @@ pub fn console_write(attr: Attribute, args: core::fmt::Arguments) {
     console.attr = attr;
     console.write_fmt(args).unwrap();
     console.attr = old_attr;
+}
+pub fn console_flush() {
+    let mut console = CONSOLE.lock();
 
     lock_frame_buffer(|fb| {
         console.render(fb, &mut font::ShinonomeFont);
