@@ -14,6 +14,10 @@ dependencies = [
 env = { "MAKE_PROFILE" = "release", QEMU_OPTS = "-monitor stdio" }
 run_task = "qemu"
 
+[tasks.run-dev]
+env = { "MAKE_PROFILE" = "debug", QEMU_OPTS = "-monitor stdio" }
+run_task = "qemu"
+
 [tasks.debug]
 env = { "MAKE_PROFILE" = "debug", QEMU_OPTS = "-monitor stdio -S -gdb tcp::${GDB_PORT}" }
 run_task = "qemu"
