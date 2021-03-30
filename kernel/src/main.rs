@@ -7,12 +7,15 @@
 
 #[macro_use]
 mod console;
+
+#[macro_use]
+mod utils;
+
 mod global;
 mod graphics;
 mod pci;
 mod sync;
 mod usb;
-mod utils;
 mod x86;
 
 use crate::graphics::{font, Color, FrameBuffer};
@@ -93,21 +96,26 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
     }
     match xhc_dev {
         Some(dev) => {
+            if dev.as_config().read_vendor_id() == 0x8086 {
+                switch_ehci_to_xhci(dev);
+            }
+
             debug!("xHC found: {:?}", dev);
             let xhc_bar = dev.read_bar(0);
             debug!("Read BAR: {:?}", xhc_bar);
             let mmio_base = (xhc_bar.unwrap() & !0x0F) as usize;
             debug!("MMIO base: {:8x}", mmio_base);
+
             let mut controller = usb::xhci::Controller::new(mmio_base).unwrap();
-
-            if dev.as_config().read_vendor_id() == 0x8086 {
-                switch_ehci_to_xhci(dev);
-            }
-
-            unsafe { controller.initialize().unwrap() };
             debug!("xHC initialized");
-            info!("xHC staring");
             controller.run();
+            controller.configure_ports();
+
+            loop {
+                if let Err(e) = controller.process_event() {
+                    error!("Error occurs during process_event: {:?}", e);
+                }
+            }
 
             todo!();
         }
@@ -115,10 +123,6 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
             error!("xHC not found");
         }
     }
-
-    const LAPIC_REG_ADDR: *const u32 = 0xFEE00020 as *const u32;
-    let lapic_id = unsafe { LAPIC_REG_ADDR.read_volatile() } >> 24;
-    info!("Local APIC ID: {}", lapic_id);
 
     loop {
         x86::hlt();

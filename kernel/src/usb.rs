@@ -5,6 +5,7 @@ pub mod xhci {
     #[derive(Debug)]
     pub enum Error {
         NoEnoughMemory,
+        InvalidPhase,
     }
     pub type Result<T> = core::result::Result<T, Error>;
 
@@ -24,33 +25,16 @@ pub mod xhci {
         }
     }
 
-    macro_rules! getter {
-        ($base:tt $([$idx:literal])? : $base_ty:ty ; $mask:expr, $offset:expr ; $ty:ty, $getter_name:ident) => {
-            pub fn $getter_name(&self) -> $ty {
-                (((self.$base $([$idx])?) & $mask) >> ($offset)) as $ty
-            }
-        };
-    }
-    macro_rules! setter {
-        ($base:tt $([$idx:literal])? : $base_ty:ty ; $mask:expr, $offset:expr ; $ty:ty, $setter_name:ident) => {
-            pub fn $setter_name(&mut self, val: $ty) {
-                self.$base $([$idx])? = self.$base $([$idx])? & (!$mask) | ((val as $base_ty) << $offset);
-            }
-        };
-    }
-
     #[allow(dead_code)]
     mod bitmap {
-
-        #[repr(C)]
-        pub struct Generic<T>(pub T);
-
         #[repr(C)]
         pub struct Hcsparams1 {
             data: u32,
         }
         impl Hcsparams1 {
-            getter!(data: u32; 0xFF, 0; u8, max_device_slots);
+            getter!(data: u32; 0x000000FF; u8, pub max_device_slots);
+
+            getter!(data: u32; 0xFF000000; u8, pub max_ports);
         }
         #[repr(C)]
         pub struct Hcsparams2 {
@@ -65,7 +49,7 @@ pub mod xhci {
             data: u32,
         }
         impl Hccparams1 {
-            getter!(data: u32; 0xFFFF0000, 16; u16, xhci_extended_capabilities_pointer);
+            getter!(data: u32; 0xFFFF0000; u16, pub xhci_extended_capabilities_pointer);
         }
 
         #[repr(C)]
@@ -79,7 +63,7 @@ pub mod xhci {
         }
         impl Rtsoff {
             // RO
-            getter!(data: u32; 0xFFFFFFE0, 5; u32, runtime_register_space_offset);
+            getter!(data: u32; 0xFFFFFFE0; u32, runtime_register_space_offset);
 
             pub fn offset(&self) -> usize {
                 (self.runtime_register_space_offset() << 5) as usize
@@ -91,14 +75,14 @@ pub mod xhci {
             data: u32,
         }
         impl Usbcmd {
-            getter!(data: u32; 0b0001, 0; u8, run_stop);
-            setter!(data: u32; 0b0001, 0; u8, set_run_stop);
+            getter!(data: u32; 0b0001; u8, pub run_stop);
+            setter!(data: u32; 0b0001; u8, pub set_run_stop);
 
-            getter!(data: u32; 0b0010, 1; u8, host_controller_reset);
-            setter!(data: u32; 0b0010, 1; u8, set_host_controller_reset);
+            getter!(data: u32; 0b0010; u8, pub host_controller_reset);
+            setter!(data: u32; 0b0010; u8, pub set_host_controller_reset);
 
-            getter!(data: u32; 0b0100, 2; u8, interrupter_enable);
-            setter!(data: u32; 0b0100, 2; u8, set_interrupter_enable);
+            getter!(data: u32; 0b0100; u8, pub interrupter_enable);
+            setter!(data: u32; 0b0100; u8, pub set_interrupter_enable);
         }
 
         #[repr(C)]
@@ -107,10 +91,10 @@ pub mod xhci {
         }
         impl Usbsts {
             // RO
-            getter!(data: u32; 0b0001, 0; u8, host_controller_halted);
+            getter!(data: u32; 0x00000001; u8, pub host_controller_halted);
 
             // RO
-            getter!(data: u32; 0b100000000000, 11; u8, controller_not_ready);
+            getter!(data: u32; 0x00000800; u8, pub controller_not_ready);
         }
 
         #[repr(C)]
@@ -118,19 +102,19 @@ pub mod xhci {
             data: u64,
         }
         impl Crcr {
-            getter!(data: u64; 0x0000000000000001, 0; u64, ring_cycle_state);
-            setter!(data: u64; 0x0000000000000001, 0; u64, set_ring_cycle_state);
+            getter!(data: u64; 0x0000000000000001; u64, pub ring_cycle_state);
+            setter!(data: u64; 0x0000000000000001; u64, pub set_ring_cycle_state);
 
             // RW1S
-            getter!(data: u64; 0x0000000000000002, 1; u64, command_stop);
-            setter!(data: u64; 0x0000000000000002, 1; u64, set_command_stop);
+            getter!(data: u64; 0x0000000000000002; u64, pub command_stop);
+            setter!(data: u64; 0x0000000000000002; u64, pub set_command_stop);
 
             // RW1S
-            getter!(data: u64; 0x0000000000000004, 2; u64, command_abort);
-            setter!(data: u64; 0x0000000000000004, 2; u64, set_command_abort);
+            getter!(data: u64; 0x0000000000000004; u64, pub command_abort);
+            setter!(data: u64; 0x0000000000000004; u64, pub set_command_abort);
 
-            getter!(data: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, command_ring_pointer);
-            setter!(data: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, set_command_ring_pointer);
+            getter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, command_ring_pointer);
+            setter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, set_command_ring_pointer);
 
             pub fn pointer(&self) -> usize {
                 (self.command_ring_pointer() << 6) as usize
@@ -146,8 +130,8 @@ pub mod xhci {
             data: u64,
         }
         impl Dcbaap {
-            getter!(data: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, device_context_base_address_array_pointer);
-            setter!(data: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, set_device_context_base_address_array_pointer);
+            getter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, device_context_base_address_array_pointer);
+            setter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, set_device_context_base_address_array_pointer);
             pub fn pointer(&self) -> usize {
                 (self.device_context_base_address_array_pointer() << 6) as usize
             }
@@ -161,8 +145,8 @@ pub mod xhci {
             data: u32,
         }
         impl Config {
-            getter!(data: u32; 0xFF, 0; u8, max_device_slots_enabled);
-            setter!(data: u32; 0xFF, 0; u8, set_max_device_slots_enabled);
+            getter!(data: u32; 0xFF; u8, pub max_device_slots_enabled);
+            setter!(data: u32; 0xFF; u8, pub set_max_device_slots_enabled);
         }
 
         #[repr(C)]
@@ -171,9 +155,9 @@ pub mod xhci {
         }
         impl ExtendedRegister {
             // RO
-            getter!(data: u32; 0x00FF, 0; u8, capability_id);
+            getter!(data: u32; 0x00FF; u8, pub capability_id);
             // RO
-            getter!(data: u32; 0xFF00, 8; u8, next_capability_pointer);
+            getter!(data: u32; 0xFF00; u8, pub next_capability_pointer);
         }
 
         #[repr(C)]
@@ -182,15 +166,15 @@ pub mod xhci {
         }
         impl Usblegsup {
             // RO
-            getter!(data: u32; 0x00FF, 0; u8, capability_id);
+            getter!(data: u32; 0x000000FF; u8, pub capability_id);
             // RO
-            getter!(data: u32; 0xFF00, 8; u8, next_capability_pointer);
+            getter!(data: u32; 0x0000FF00; u8, pub next_capability_pointer);
 
-            getter!(data: u32; 0x00010000, 16; u8, hc_bios_owned_semaphore);
-            setter!(data: u32; 0x00010000, 16; u8, set_hc_bios_owned_semaphore);
+            getter!(data: u32; 0x00010000; u8, pub hc_bios_owned_semaphore);
+            setter!(data: u32; 0x00010000; u8, pub set_hc_bios_owned_semaphore);
 
-            getter!(data: u32; 0x01000000, 24; u8, hc_os_owned_semaphore);
-            setter!(data: u32; 0x01000000, 24; u8, set_hc_os_owned_semaphore);
+            getter!(data: u32; 0x01000000; u8, pub hc_os_owned_semaphore);
+            setter!(data: u32; 0x01000000; u8, pub set_hc_os_owned_semaphore);
         }
 
         #[repr(C)]
@@ -199,11 +183,11 @@ pub mod xhci {
         }
         impl Iman {
             // RW1C
-            getter!(data: u32; 0x00000001, 0; u8, interrupt_pending);
-            setter!(data: u32; 0x00000001, 0; u8, set_interrupt_pending);
+            getter!(data: u32; 0x00000001; u8, pub interrupt_pending);
+            setter!(data: u32; 0x00000001; u8, pub set_interrupt_pending);
 
-            getter!(data: u32; 0x00000002, 1; u8, interrupter_enable);
-            setter!(data: u32; 0x00000002, 1; u8, set_interrupt_enable);
+            getter!(data: u32; 0x00000002; u8, pub interrupter_enable);
+            setter!(data: u32; 0x00000002; u8, pub set_interrupt_enable);
         }
 
         #[repr(C)]
@@ -216,8 +200,8 @@ pub mod xhci {
             data: u32,
         }
         impl Erstsz {
-            getter!(data: u32; 0x0000FFFF, 0; u16, event_ring_segment_table_size);
-            setter!(data: u32; 0x0000FFFF, 0; u16, set_event_ring_segment_table_size);
+            getter!(data: u32; 0x0000FFFF; u16, pub event_ring_segment_table_size);
+            setter!(data: u32; 0x0000FFFF; u16, pub set_event_ring_segment_table_size);
         }
 
         #[repr(C)]
@@ -225,8 +209,8 @@ pub mod xhci {
             data: u64,
         }
         impl Erstba {
-            getter!(data: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, event_ring_segment_table_base_address);
-            setter!(data: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, set_event_ring_segment_table_base_address);
+            getter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, event_ring_segment_table_base_address);
+            setter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, set_event_ring_segment_table_base_address);
 
             pub fn pointer(&self) -> usize {
                 (self.event_ring_segment_table_base_address() << 6) as usize
@@ -241,23 +225,62 @@ pub mod xhci {
             data: u64,
         }
         impl Erdp {
-            getter!(data: u64; 0xFFFFFFFFFFFFFFF0, 4; u64, event_ring_dequeue_pointer);
-            setter!(data: u64; 0xFFFFFFFFFFFFFFF0, 4; u64, set_event_ring_dequeue_pointer);
+            getter!(data: u64; 0xFFFFFFFFFFFFFFF0; u64, event_ring_dequeue_pointer);
+            setter!(data: u64; 0xFFFFFFFFFFFFFFF0; u64, set_event_ring_dequeue_pointer);
 
             pub fn pointer(&self) -> usize {
-                (self.event_ring_dequeue_pointer() << 6) as usize
+                (self.event_ring_dequeue_pointer() << 4) as usize
             }
             pub fn set_pointer(&mut self, ptr: usize) {
-                self.set_event_ring_dequeue_pointer((ptr as u64) >> 6)
+                self.set_event_ring_dequeue_pointer((ptr as u64) >> 4)
             }
+        }
+
+        #[repr(C)]
+        pub struct Portsc {
+            pub data: u32,
+        }
+        impl Portsc {
+            // ROS
+            getter!(data: u32; 0x00000001; u8, pub current_connect_status);
+
+            // RW1CS
+            getter!(data: u32; 0x00000002; u8, pub port_enabled_disabled);
+
+            // RW1S
+            getter!(data: u32; 0x00000010; u8, pub port_reset);
+
+            // ROS
+            getter!(data: u32; 0x00003C00; u8, pub port_speed);
+
+            // RW1CS
+            getter!(data: u32; 0x00020000; u8, pub connect_status_change);
+
+            // RW1CS
+            getter!(data: u32; 0x00200000; u8, pub port_reset_change);
+        }
+
+        #[repr(C)]
+        pub struct Portmsc {
+            data: u32,
+        }
+
+        #[repr(C)]
+        pub struct Portli {
+            data: u32,
+        }
+
+        #[repr(C)]
+        pub struct Porthlpmc {
+            data: u32,
         }
     }
 
     #[repr(C)]
     struct CapabilityRegisters {
-        caplength: MemMapped<bitmap::Generic<u8>>,
+        caplength: MemMapped<u8>,
         _reserved1: u8,
-        hciversion: MemMapped<bitmap::Generic<u16>>,
+        hciversion: MemMapped<u16>,
         hcsparams1: MemMapped<bitmap::Hcsparams1>,
         hcsparams2: MemMapped<bitmap::Hcsparams2>,
         hcsparams3: MemMapped<bitmap::Hcsparams3>,
@@ -270,9 +293,9 @@ pub mod xhci {
     struct OperationalRegisters {
         usbcmd: MemMapped<bitmap::Usbcmd>,
         usbsts: MemMapped<bitmap::Usbsts>,
-        pagesize: MemMapped<bitmap::Generic<u32>>,
+        pagesize: MemMapped<u32>,
         _reserved1: [u32; 2],
-        dnctrl: MemMapped<bitmap::Generic<u32>>,
+        dnctrl: MemMapped<u32>,
         crcr: MemMapped<bitmap::Crcr>,
         _reserved2: [u32; 4],
         dcbaap: MemMapped<bitmap::Dcbaap>,
@@ -289,6 +312,14 @@ pub mod xhci {
         erdp: MemMapped<bitmap::Erdp>,
     }
 
+    #[repr(C)]
+    struct PortRegisterSet {
+        portsc: MemMapped<bitmap::Portsc>,
+        portmsc: MemMapped<bitmap::Portmsc>,
+        portli: MemMapped<bitmap::Portli>,
+        porthlpmc: MemMapped<bitmap::Porthlpmc>,
+    }
+
     pub struct Controller {
         mmio_base: usize,
         cap_regs: *mut CapabilityRegisters,
@@ -296,23 +327,115 @@ pub mod xhci {
         devmgr: DeviceManager,
         cr: CommandRing,
         er: EventRing,
+        ports: *mut [Port],
+        max_ports: u8,
+        addressing_port: Option<u8>,
     }
     impl Controller {
+        const DEVICES_SIZE: usize = 8;
+
         pub fn new(mmio_base: usize) -> Result<Self> {
             let cap_regs = mmio_base as *mut CapabilityRegisters;
             let caplength = unsafe { (*cap_regs).caplength.read() };
-            let op_regs = (mmio_base + caplength.0 as usize) as *mut OperationalRegisters;
+            let op_regs = (mmio_base + caplength as usize) as *mut OperationalRegisters;
+            let max_ports = unsafe { (*cap_regs).hcsparams1.read().max_ports() };
+            let mut er = EventRing::with_capacity(32)?;
+
+            // Host controller must be halted
+            if unsafe { (*op_regs).usbsts.read().host_controller_halted() == 0 } {
+                panic!("Host controller not halted");
+            }
+
+            Self::request_hc_ownership(mmio_base, cap_regs);
+
+            // Reset controller
+            unsafe {
+                (*op_regs).usbcmd.modify_with(|usbcmd| {
+                    usbcmd.set_host_controller_reset(1);
+                });
+                while (*op_regs).usbcmd.read().host_controller_reset() != 0 {}
+                while (*op_regs).usbsts.read().controller_not_ready() != 0 {}
+            }
+
+            let max_slots = unsafe { (*cap_regs).hcsparams1.read().max_device_slots() };
+            debug!("MaxSlots: {}", max_slots);
+            assert!(Self::DEVICES_SIZE < max_slots as usize);
+            let slots = core::cmp::min(max_slots, Self::DEVICES_SIZE as u8);
+
+            let devmgr = DeviceManager::new(slots as usize)?;
+
+            // Set "Max Slots Enabled" field in CONFIG
+            unsafe {
+                (*op_regs).config.modify_with(|config| {
+                    config.set_max_device_slots_enabled(slots);
+                })
+            };
+
+            // TODO: scratchpad buffers
+
+            let mut dcbaap = bitmap::Dcbaap::default();
+            let device_contexts = devmgr.device_contexts();
+            dcbaap.set_pointer(device_contexts as usize);
+            unsafe { (*op_regs).dcbaap.write(dcbaap) };
+
+            let primary_interrupter = Self::interrupter_register_sets(mmio_base, cap_regs);
+            debug!("primary_interrupter = {:p}", primary_interrupter);
+
+            let cr = CommandRing::with_capacity(32)?;
+            // register command ring
+            unsafe {
+                (*op_regs).crcr.modify_with(|value| {
+                    value.set_ring_cycle_state(1);
+                    value.set_command_stop(0);
+                    value.set_command_abort(0);
+                    value.set_pointer(cr.buffer());
+                })
+            };
+
+            er.initialize(primary_interrupter);
+
+            // Enable interrupt for the primary interrupter
+            unsafe {
+                (*primary_interrupter).iman.modify_with(|iman| {
+                    iman.set_interrupt_pending(1);
+                    iman.set_interrupt_enable(1);
+                })
+            };
+
+            // Enable interrupt for the controller
+            unsafe {
+                (*op_regs).usbcmd.modify_with(|usbcmd| {
+                    usbcmd.set_interrupter_enable(1);
+                })
+            };
+
+            // initialize ports
+            let ports = unsafe { MALLOC.alloc_slice::<Port>(max_ports as usize) }
+                .ok_or(Error::NoEnoughMemory)?;
+            {
+                let port_regs_origin = Self::port_register_set(op_regs);
+                let ports: &mut [MaybeUninit<Port>] = unsafe { &mut *ports.as_ptr() };
+                for port_num in 1..=max_ports {
+                    let port_regs = unsafe { port_regs_origin.add((port_num - 1) as usize) };
+                    ports[(port_num - 1) as usize] =
+                        MaybeUninit::new(Port::new(port_num, port_regs));
+                }
+            }
+
             Ok(Self {
                 mmio_base,
                 cap_regs,
                 op_regs,
-                devmgr: DeviceManager::new(),
-                cr: CommandRing::with_capacity(32)?,
-                er: EventRing::with_capacity(32)?,
+                devmgr,
+                cr,
+                er,
+                ports: ports.as_ptr() as *mut [Port],
+                max_ports,
+                addressing_port: None,
             })
         }
 
-        fn request_hc_ownership(&mut self) {
+        fn request_hc_ownership(mmio_base: usize, cap_regs: *mut CapabilityRegisters) {
             type MmExtendedReg = MemMapped<bitmap::ExtendedRegister>;
 
             fn next(current: *mut MmExtendedReg, step: usize) -> *mut MmExtendedReg {
@@ -323,9 +446,9 @@ pub mod xhci {
                 }
             }
 
-            let hccp = unsafe { (*self.cap_regs).hccparams1.read() };
+            let hccp = unsafe { (*cap_regs).hccparams1.read() };
             let mut ptr = next(
-                self.mmio_base as *mut _,
+                mmio_base as *mut _,
                 hccp.xhci_extended_capabilities_pointer() as usize,
             );
             let usb_reg_sup = loop {
@@ -366,75 +489,20 @@ pub mod xhci {
             debug!("OS has owned xHC");
         }
 
-        fn register_command_ring(&mut self) {
-            unsafe {
-                (*self.op_regs).crcr.modify_with(|value| {
-                    value.set_ring_cycle_state(1);
-                    value.set_command_stop(0);
-                    value.set_command_abort(0);
-                    value.set_pointer(self.cr.buffer());
-                })
-            };
+        fn interrupter_register_sets(
+            mmio_base: usize,
+            cap_regs: *mut CapabilityRegisters,
+        ) -> *mut InterrupterRegisterSet {
+            let rtsoff = unsafe { (*cap_regs).rtsoff.read().offset() };
+            (mmio_base + rtsoff + 0x20) as *mut InterrupterRegisterSet
         }
 
-        fn interrupter_register_sets(&self) -> *mut InterrupterRegisterSet {
-            let rtsoff = unsafe { (*self.cap_regs).rtsoff.read().offset() };
-            (self.mmio_base + rtsoff + 0x20) as *mut InterrupterRegisterSet
-        }
-
-        const DEVICES_SIZE: usize = 8;
-
-        pub unsafe fn initialize(&mut self) -> Result<()> {
-            // Host controller must be halted
-            if (*self.op_regs).usbsts.read().host_controller_halted() == 0 {
-                panic!("Host controller not halted");
-            }
-
-            self.request_hc_ownership();
-
-            // Reset controller
-            (*self.op_regs).usbcmd.modify_with(|usbcmd| {
-                usbcmd.set_host_controller_reset(1);
-            });
-            while (*self.op_regs).usbcmd.read().host_controller_reset() != 0 {}
-            while (*self.op_regs).usbsts.read().controller_not_ready() != 0 {}
-
-            let max_slots = (*self.cap_regs).hcsparams1.read().max_device_slots();
-            debug!("MaxSlots: {}", max_slots);
-            assert!(Self::DEVICES_SIZE < max_slots as usize);
-            let slots = core::cmp::min(max_slots, Self::DEVICES_SIZE as u8);
-
-            self.devmgr.initialize(slots as usize)?;
-
-            // Set "Max Slots Enabled" field in CONFIG
-            (*self.op_regs).config.modify_with(|config| {
-                config.set_max_device_slots_enabled(slots);
-            });
-
-            let mut dcbaap = bitmap::Dcbaap::default();
-            let device_contexts = self.devmgr.device_contexts();
-            dcbaap.set_pointer(device_contexts as usize);
-            (*self.op_regs).dcbaap.write(dcbaap);
-
-            let primary_interrupter = self.interrupter_register_sets();
-            self.register_command_ring();
-            self.er.initialize(primary_interrupter);
-
-            // Enable interrupt for the primary interrupter
-            (*primary_interrupter).iman.modify_with(|iman| {
-                iman.set_interrupt_pending(1);
-                iman.set_interrupt_enable(1);
-            });
-
-            // Enable interrupt for the controller
-            (*self.op_regs).usbcmd.modify_with(|usbcmd| {
-                usbcmd.set_interrupter_enable(1);
-            });
-
-            Ok(())
+        fn port_register_set(op_regs: *mut OperationalRegisters) -> *mut PortRegisterSet {
+            ((op_regs as usize) + 0x400) as *mut PortRegisterSet
         }
 
         pub fn run(&mut self) {
+            info!("xHC staring");
             // Run the controller
             unsafe {
                 (*self.op_regs).usbcmd.modify_with(|usbcmd| {
@@ -442,6 +510,65 @@ pub mod xhci {
                 })
             };
             while unsafe { (*self.op_regs).usbsts.read().host_controller_halted() } == 1 {}
+        }
+
+        pub fn max_ports(&self) -> u8 {
+            self.max_ports
+        }
+
+        pub fn port_at(&self, port_num: u8) -> &Port {
+            assert!(0 < port_num && port_num <= self.max_ports);
+            unsafe { &(*self.ports)[(port_num as usize) - 1] }
+        }
+        pub fn port_at_mut(&mut self, port_num: u8) -> &mut Port {
+            assert!(0 < port_num && port_num <= self.max_ports);
+            unsafe { &mut (*self.ports)[(port_num as usize) - 1] }
+        }
+
+        pub fn configure_ports(&mut self) {
+            trace!("configure_ports");
+            for port_num in 1..=self.max_ports {
+                if !self.port_at(port_num).is_connected() {
+                    continue;
+                }
+                debug!("Port {}: connected", port_num);
+                if self.port_at(port_num).config_phase() == PortConfigPhase::NotConnected {
+                    if let Err(e) = self.reset_port(port_num) {
+                        error!("Failed to configure the port {}: {:?}", port_num, e);
+                    }
+                }
+            }
+        }
+
+        fn reset_port(&mut self, port_num: u8) -> Result<()> {
+            if !self.port_at(port_num).is_connected() {
+                return Ok(());
+            }
+
+            match self.addressing_port {
+                Some(_) => {
+                    self.port_at_mut(port_num)
+                        .set_config_phase(PortConfigPhase::WaitingAddressed);
+                }
+                None => {
+                    let port = self.port_at_mut(port_num);
+                    if port.config_phase() != PortConfigPhase::NotConnected
+                        && port.config_phase() != PortConfigPhase::WaitingAddressed
+                    {
+                        return Err(Error::InvalidPhase);
+                    }
+                    port.set_config_phase(PortConfigPhase::ResettingPort);
+                    port.reset();
+                }
+            }
+            Ok(())
+        }
+
+        pub fn process_event(&mut self) -> Result<()> {
+            if let Some(trb) = self.er.front() {
+                trace!("event found");
+            }
+            Ok(())
         }
     }
 
@@ -536,12 +663,46 @@ pub mod xhci {
             };
         }
 
-        pub fn write_dequeue_pointer(&mut self, ptr: *const Trb) {
+        pub fn front(&self) -> Option<*const Trb> {
+            if self.has_front() {
+                Some(self.read_dequeue_pointer())
+            } else {
+                None
+            }
+        }
+
+        pub fn pop(&mut self) {
+            let mut new_front = unsafe { self.read_dequeue_pointer().add(1) };
+
+            // FIXME: we should consider multiple segments.
+            {
+                let begin = self.event_ring_segment_table()[0].pointer() as *const Trb;
+                let size = self.event_ring_segment_table()[0].ring_segment_size();
+                let end = unsafe { begin.add(size as usize) };
+
+                if new_front == end {
+                    new_front = begin;
+                    self.cycle_bit = !self.cycle_bit;
+                }
+            }
+
+            self.write_dequeue_pointer(new_front);
+        }
+
+        fn write_dequeue_pointer(&mut self, ptr: *const Trb) {
             unsafe {
                 (*self.interrupter).erdp.modify_with(|erdp| {
                     erdp.set_pointer(ptr as usize);
                 })
             };
+        }
+
+        fn read_dequeue_pointer(&self) -> *const Trb {
+            unsafe { (*self.interrupter).erdp.read().pointer() as *const Trb }
+        }
+
+        fn has_front(&self) -> bool {
+            unsafe { (*self.read_dequeue_pointer()).cycle_bit() == self.cycle_bit as u8 }
         }
 
         fn event_ring_segment_table(&mut self) -> &mut [EventRingSegmentTableEntry] {
@@ -554,10 +715,11 @@ pub mod xhci {
         data: [u64; 2],
     }
     impl EventRingSegmentTableEntry {
-        getter!(data[0]: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, ring_segment_base_address);
-        setter!(data[0]: u64; 0xFFFFFFFFFFFFFFC0, 6; u64, set_ring_segment_base_address);
-        getter!(data[1]: u64; 0x000000000000FFFF, 0; u16, ring_segment_size);
-        setter!(data[1]: u64; 0x000000000000FFFF, 0; u16, set_ring_segment_size);
+        getter!(data[0]: u64; 0xFFFFFFFFFFFFFFC0; u64, ring_segment_base_address);
+        setter!(data[0]: u64; 0xFFFFFFFFFFFFFFC0; u64, set_ring_segment_base_address);
+
+        getter!(data[1]: u64; 0x000000000000FFFF; u16, pub ring_segment_size);
+        setter!(data[1]: u64; 0x000000000000FFFF; u16, pub set_ring_segment_size);
 
         pub fn pointer(&self) -> usize {
             (self.ring_segment_base_address() << 6) as usize
@@ -570,6 +732,22 @@ pub mod xhci {
     #[repr(C, align(64))]
     struct Trb {
         data: [u32; 4],
+    }
+    impl Trb {
+        getter!(data[2]: u32; 0xFFFFFFFF; u32, pub status);
+        setter!(data[2]: u32; 0xFFFFFFFF; u32, pub set_status);
+
+        getter!(data[3]: u32; 0x00000001;  u8, pub cycle_bit);
+        setter!(data[3]: u32; 0x00000001;  u8, pub set_cycle_bit);
+
+        getter!(data[3]: u32; 0x00000002;  u8, pub evaluate_next_trb);
+        setter!(data[3]: u32; 0x00000002;  u8, pub set_evaluate_next_trb);
+
+        getter!(data[3]: u32; 0x0000FC00;  u8, pub trb_type);
+        setter!(data[3]: u32; 0x0000FC00;  u8, pub set_trb_type);
+
+        getter!(data[3]: u32; 0xFFFF0000; u16, pub control);
+        setter!(data[3]: u32; 0xFFFF0000; u16, pub set_control);
     }
 
     #[repr(C, align(64))]
@@ -654,17 +832,7 @@ pub mod xhci {
         num_devices: usize,
     }
     impl DeviceManager {
-        pub fn new() -> Self {
-            use core::ptr::slice_from_raw_parts_mut;
-            Self {
-                devices: slice_from_raw_parts_mut(null_mut(), 0),
-                device_context_pointers: slice_from_raw_parts_mut(null_mut(), 0),
-                num_devices: 0,
-            }
-        }
-        pub fn initialize(&mut self, num_devices: usize) -> Result<()> {
-            self.num_devices = num_devices;
-
+        pub fn new(num_devices: usize) -> Result<Self> {
             let devices = unsafe { MALLOC.alloc_slice::<Device>(num_devices) }
                 .ok_or(Error::NoEnoughMemory)?;
             {
@@ -673,7 +841,6 @@ pub mod xhci {
                     unsafe { Device::initialize_ptr(p.as_mut_ptr()) };
                 }
             }
-            self.devices = devices.as_ptr() as *mut [Device];
 
             let device_context_pointers =
                 unsafe { MALLOC.alloc_slice::<*mut DeviceContext>(num_devices + 1) }
@@ -685,15 +852,18 @@ pub mod xhci {
                     *p = MaybeUninit::new(null_mut());
                 }
             }
-            self.device_context_pointers =
-                device_context_pointers.as_ptr() as *mut [*mut DeviceContext];
 
             debug!(
                 "DeviceManager has been initialized for up to {} devices",
                 num_devices
             );
 
-            Ok(())
+            Ok(Self {
+                devices: devices.as_ptr() as *mut [Device],
+                device_context_pointers: device_context_pointers.as_ptr()
+                    as *mut [*mut DeviceContext],
+                num_devices,
+            })
         }
 
         pub fn device_contexts(&self) -> *mut *mut DeviceContext {
@@ -703,7 +873,108 @@ pub mod xhci {
         }
     }
 
+    pub enum PortSpeed {
+        Full,
+        Low,
+        High,
+        Super,
+        SuperPlus,
+    }
+    impl From<u8> for PortSpeed {
+        fn from(speed: u8) -> Self {
+            match speed {
+                1 => Self::Full,
+                2 => Self::Low,
+                3 => Self::High,
+                4 => Self::Super,
+                5 => Self::SuperPlus,
+                _ => panic!("invalid speed: {}", speed),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum PortConfigPhase {
+        NotConnected,
+        WaitingAddressed,
+        ResettingPort,
+        EnablingSlot,
+        AddressingDevice,
+        InitializingDevice,
+        ConfiguringEndpoints,
+        Configured,
+    }
+
+    pub struct Port {
+        port_num: u8,
+        regs: *mut PortRegisterSet,
+        config_phase: PortConfigPhase,
+    }
+    impl Port {
+        fn new(port_num: u8, regs: *mut PortRegisterSet) -> Self {
+            Self {
+                port_num,
+                regs,
+                config_phase: PortConfigPhase::NotConnected,
+            }
+        }
+
+        pub fn config_phase(&self) -> PortConfigPhase {
+            self.config_phase
+        }
+        fn set_config_phase(&mut self, cp: PortConfigPhase) {
+            self.config_phase = cp;
+        }
+
+        pub fn reset(&mut self) {
+            unsafe {
+                (*self.regs).portsc.modify_with(|portsc| {
+                    portsc.data &= 0x0E00C3E0;
+                    portsc.data |= 0x00020010; // Write 1 to PR and CSC
+                })
+            };
+            while unsafe { (*self.regs).portsc.read().port_reset() == 1 } {}
+        }
+
+        pub fn number(&self) -> u8 {
+            self.port_num
+        }
+
+        pub fn is_connected(&self) -> bool {
+            unsafe { (*self.regs).portsc.read().current_connect_status() == 1 }
+        }
+
+        pub fn is_enabled(&self) -> bool {
+            unsafe { (*self.regs).portsc.read().port_enabled_disabled() == 1 }
+        }
+
+        pub fn is_connect_status_changed(&self) -> bool {
+            unsafe { (*self.regs).portsc.read().connect_status_change() == 1 }
+        }
+
+        pub fn is_port_reset_changed(&self) -> bool {
+            unsafe { (*self.regs).portsc.read().port_reset_change() == 1 }
+        }
+
+        pub fn speed(&self) -> PortSpeed {
+            unsafe { (*self.regs).portsc.read().port_speed() }.into()
+        }
+    }
+
     use crate::utils::StaticMallocator;
     const BUF_SIZE: usize = 4096 * 32;
     static mut MALLOC: StaticMallocator<BUF_SIZE> = StaticMallocator::new();
+}
+
+pub mod class_driver {
+    pub trait Driver {}
+    pub trait HidDriver: Driver {}
+
+    pub struct HidMouseDriver {}
+    impl Driver for HidMouseDriver {}
+    impl HidDriver for HidMouseDriver {}
+
+    pub struct HidKeyboardDriver {}
+    impl Driver for HidKeyboardDriver {}
+    impl HidDriver for HidKeyboardDriver {}
 }
