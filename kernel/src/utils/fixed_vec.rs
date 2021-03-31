@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 
 use core::mem::MaybeUninit;
-use core::mem::{align_of, size_of};
-use core::ptr::NonNull;
 
 pub struct FixedVec<T, const CAPACITY: usize> {
     buf: MaybeUninit<[T; CAPACITY]>,
