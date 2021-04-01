@@ -315,7 +315,7 @@ pub mod xhci {
         }
     }
 
-    #[repr(C)]
+    #[repr(C, packed(4))]
     struct CapabilityRegisters {
         caplength: MemMapped<u8>,
         _reserved1: u8,
@@ -328,7 +328,7 @@ pub mod xhci {
         rtsoff: MemMapped<bitmap::Rtsoff>,
     }
 
-    #[repr(C)]
+    #[repr(C, packed(4))]
     struct OperationalRegisters {
         usbcmd: MemMapped<bitmap::Usbcmd>,
         usbsts: MemMapped<bitmap::Usbsts>,
@@ -341,7 +341,7 @@ pub mod xhci {
         config: MemMapped<bitmap::Config>,
     }
 
-    #[repr(C)]
+    #[repr(C, packed(4))]
     struct InterrupterRegisterSet {
         iman: MemMapped<bitmap::Iman>,
         imod: MemMapped<bitmap::Imod>,
@@ -351,7 +351,7 @@ pub mod xhci {
         erdp: MemMapped<bitmap::Erdp>,
     }
 
-    #[repr(C)]
+    #[repr(C, packed(4))]
     struct PortRegisterSet {
         portsc: MemMapped<bitmap::Portsc>,
         portmsc: MemMapped<bitmap::Portmsc>,
@@ -359,7 +359,7 @@ pub mod xhci {
         porthlpmc: MemMapped<bitmap::Porthlpmc>,
     }
 
-    #[repr(C)]
+    #[repr(C, packed(4))]
     struct DoorbellRegister {
         reg: MemMapped<bitmap::Doorbell>,
     }
@@ -879,7 +879,7 @@ pub mod xhci {
     }
     // TODO: (carefully) impl Drop for EventRing
 
-    #[repr(C, align(64))]
+    #[repr(C, packed(4))]
     struct EventRingSegmentTableEntry {
         data: [u64; 2],
     }
@@ -919,7 +919,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         #[derive(Clone)]
         pub struct Trb {
             pub data: [u32; 4],
@@ -956,7 +956,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct Link {
             data: [u32; 4],
         }
@@ -975,7 +975,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct EnableSlotCommand {
             data: [u32; 4],
         }
@@ -993,7 +993,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct AddressDeviceCommand {
             data: [u32; 4],
         }
@@ -1032,7 +1032,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct ConfigureEndpointCommand {
             data: [u32; 4],
         }
@@ -1045,7 +1045,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct TransferEvent {
             data: [u32; 4],
         }
@@ -1055,7 +1055,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct CommandCompletionEvent {
             data: [u32; 4],
         }
@@ -1077,7 +1077,7 @@ pub mod xhci {
             }
         }
 
-        #[repr(C)]
+        #[repr(C, align(16))]
         pub struct PortStatusChangeEvent {
             data: [u32; 4],
         }
@@ -1178,7 +1178,7 @@ pub mod xhci {
         }
     }
 
-    #[repr(C)]
+    #[repr(C, align(32))]
     struct InputControlContext {
         drop_context_flags: u32,
         add_context_flags: u32,
