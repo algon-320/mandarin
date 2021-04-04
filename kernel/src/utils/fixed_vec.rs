@@ -3,15 +3,19 @@
 use core::mem::MaybeUninit;
 
 pub struct FixedVec<T, const CAPACITY: usize> {
-    buf: MaybeUninit<[T; CAPACITY]>,
+    buf: [MaybeUninit<T>; CAPACITY],
     len: usize,
 }
 impl<T, const CAPACITY: usize> FixedVec<T, CAPACITY> {
     pub const fn new() -> Self {
         Self {
-            buf: MaybeUninit::uninit(),
+            buf: unsafe { MaybeUninit::uninit().assume_init() },
             len: 0,
         }
+    }
+    pub unsafe fn initialize_ptr(ptr: *mut Self) {
+        let len = core::ptr::addr_of_mut!((*ptr).len);
+        len.write(0);
     }
     pub fn capacity(&self) -> usize {
         CAPACITY

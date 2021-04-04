@@ -4,6 +4,7 @@
 #![feature(custom_test_frameworks)]
 #![test_runner(test_runner)]
 #![reexport_test_harness_main = "test_main"]
+#![feature(const_maybe_uninit_assume_init)]
 
 #[macro_use]
 mod console;
@@ -114,6 +115,7 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
             loop {
                 if let Err(e) = controller.process_event() {
                     error!("Error occurs during process_event: {:?}", e);
+                    panic!("error");
                 }
             }
 
