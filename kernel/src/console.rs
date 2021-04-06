@@ -98,6 +98,7 @@ impl Console {
         }
     }
 
+    #[cfg(feature = "graphics")]
     pub fn render<R: Render, F: Font>(&mut self, renderer: &mut R, font: &mut F) {
         let (char_w, char_h) = font.char_size('M');
         for line in 0..self.lines {
@@ -119,6 +120,9 @@ impl Console {
             }
         }
     }
+
+    #[cfg(not(feature = "graphics"))]
+    pub fn render<R: Render, F: Font>(&mut self, renderer: &mut R, font: &mut F) {}
 }
 
 impl core::fmt::Write for Console {
