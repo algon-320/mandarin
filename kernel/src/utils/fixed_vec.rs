@@ -6,6 +6,15 @@ pub struct FixedVec<T, const CAPACITY: usize> {
     buf: [MaybeUninit<T>; CAPACITY],
     len: usize,
 }
+pub struct FixedVecIter<'buf, T> {
+    buf: &'buf [MaybeUninit<T>],
+    idx: usize,
+}
+pub struct FixedVecIterMut<'buf, T> {
+    buf: &'buf mut [MaybeUninit<T>],
+    idx: usize,
+}
+
 impl<T, const CAPACITY: usize> FixedVec<T, CAPACITY> {
     pub const fn new() -> Self {
         Self {
@@ -68,6 +77,43 @@ impl<T, const CAPACITY: usize> FixedVec<T, CAPACITY> {
             drop(x);
         }
     }
+    pub fn iter(&self) -> FixedVecIter<'_, T> {
+        FixedVecIter {
+            buf: &self.buf[..self.len],
+            idx: 0,
+        }
+    }
+    pub fn iter_mut(&mut self) -> FixedVecIterMut<'_, T> {
+        FixedVecIterMut {
+            buf: &mut self.buf[..self.len],
+            idx: 0,
+        }
+    }
+}
+
+impl<'buf, T> Iterator for FixedVecIter<'buf, T> {
+    type Item = &'buf T;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx == self.buf.len() {
+            None
+        } else {
+            let ret = Some(unsafe { &*self.buf[self.idx].as_ptr() });
+            self.idx += 1;
+            ret
+        }
+    }
+}
+impl<'buf, T> Iterator for FixedVecIterMut<'buf, T> {
+    type Item = &'buf mut T;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx == self.buf.len() {
+            None
+        } else {
+            let ret = Some(unsafe { &mut *self.buf[self.idx].as_mut_ptr() });
+            self.idx += 1;
+            ret
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +164,49 @@ mod tests {
             assert_eq!(FIXED_VEC.len(), 10);
             assert_eq!(FIXED_VEC.push(10), None);
             assert_eq!(FIXED_VEC.push(11), None);
+        }
+    }
+    #[test_case]
+    fn test_fixed_vec_iter() {
+        static mut FIXED_VEC: FixedVec<i32, 10> = FixedVec::new();
+        unsafe {
+            FIXED_VEC.push(1);
+            FIXED_VEC.push(2);
+            FIXED_VEC.push(3);
+
+            let mut iter = FIXED_VEC.iter();
+            assert_eq!(iter.next(), Some(&1));
+            assert_eq!(iter.next(), Some(&2));
+            assert_eq!(iter.next(), Some(&3));
+            assert_eq!(iter.next(), None);
+            assert_eq!(iter.next(), None);
+
+            let mut iter = FIXED_VEC.iter();
+            assert_eq!(iter.next(), Some(&1));
+            assert_eq!(iter.next(), Some(&2));
+            assert_eq!(iter.next(), Some(&3));
+            assert_eq!(iter.next(), None);
+
+            let mut iter = FIXED_VEC.iter_mut();
+            assert_eq!(iter.next(), Some(&mut 1));
+            assert_eq!(iter.next(), Some(&mut 2));
+            assert_eq!(iter.next(), Some(&mut 3));
+            assert_eq!(iter.next(), None);
+
+            let mut iter = FIXED_VEC.iter_mut();
+            assert_eq!(iter.next(), Some(&mut 1));
+            assert_eq!(iter.next(), Some(&mut 2));
+            assert_eq!(iter.next(), Some(&mut 3));
+            assert_eq!(iter.next(), None);
+
+            for elem in FIXED_VEC.iter_mut() {
+                *elem = *elem * 2;
+            }
+            let mut iter = FIXED_VEC.iter_mut();
+            assert_eq!(iter.next(), Some(&mut 2));
+            assert_eq!(iter.next(), Some(&mut 4));
+            assert_eq!(iter.next(), Some(&mut 6));
+            assert_eq!(iter.next(), None);
         }
     }
 }
