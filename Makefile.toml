@@ -1,4 +1,5 @@
 [env]
+OVMF_DIR = "/usr/share/OVMF"
 IMAGE = "disk.img"
 GDB_PORT = "12345"
 
@@ -85,7 +86,7 @@ files_not_exist = [
 [tasks.prepare-ovmf]
 script = '''
 mkdir -p ./uefi-firmware
-cp /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_VARS.fd ./uefi-firmware/
+cp ${OVMF_DIR}/OVMF_CODE.fd ${OVMF_DIR}/OVMF_VARS.fd ./uefi-firmware/
 '''
 
 
