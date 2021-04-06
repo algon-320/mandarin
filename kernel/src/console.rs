@@ -103,19 +103,19 @@ impl Console {
         let (char_w, char_h) = font.char_size('M');
         for line in 0..self.lines {
             for col in 0..self.columns {
-                renderer.draw_filled_rect(
-                    col as isize * char_w,
-                    line as isize * char_h,
-                    char_w,
-                    char_h,
-                    self.attr.bg,
-                );
                 let idx = line * self.columns + col;
                 if let Cell { ch: Some(ch), attr } = self.cells[idx] {
                     let x = char_w * col as isize;
                     let y = char_h * line as isize;
-                    renderer.draw_filled_rect(x, y, char_w, char_h, attr.bg);
-                    font.draw_char(renderer, x, y, attr.fg, ch);
+                    font.draw_char(renderer, x, y, attr.fg, Some(attr.bg), ch);
+                } else if line == 0 || self.cells[idx - self.columns].ch.is_some() {
+                    renderer.draw_filled_rect(
+                        col as isize * char_w,
+                        line as isize * char_h,
+                        char_w,
+                        char_h,
+                        self.attr.bg,
+                    );
                 }
             }
         }

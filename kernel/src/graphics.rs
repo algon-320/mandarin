@@ -107,8 +107,24 @@ pub mod font {
 
     pub trait Font {
         fn char_size(&mut self, ch: char) -> (isize, isize);
-        fn draw_char<R: Render>(&mut self, r: &mut R, x: isize, y: isize, c: Color, ch: char);
-        fn draw_str<R: Render>(&mut self, r: &mut R, x: isize, y: isize, c: Color, s: &str);
+        fn draw_char<R: Render>(
+            &mut self,
+            r: &mut R,
+            x: isize,
+            y: isize,
+            fg: Color,
+            bg: Option<Color>,
+            ch: char,
+        );
+        fn draw_str<R: Render>(
+            &mut self,
+            r: &mut R,
+            x: isize,
+            y: isize,
+            fg: Color,
+            bg: Option<Color>,
+            s: &str,
+        );
     }
 
     pub struct ShinonomeFont;
@@ -121,7 +137,8 @@ pub mod font {
             renderer: &mut R,
             x: isize,
             y: isize,
-            c: Color,
+            fg: Color,
+            bg: Option<Color>,
             ch: char,
         ) {
             const SHINONOME_FONT: &[u8] = include_bytes!("../assets/hankaku.bin");
@@ -133,7 +150,9 @@ pub mod font {
                 let row = SHINONOME_FONT[ch * 16 + iy];
                 for ix in 0..8 {
                     if row & (0x80 >> ix) != 0 {
-                        renderer.draw_pixel(1 + x + ix as isize, 1 + y + iy as isize, c);
+                        renderer.draw_pixel(1 + x + ix as isize, 1 + y + iy as isize, fg);
+                    } else if let Some(bg) = bg {
+                        renderer.draw_pixel(1 + x + ix as isize, 1 + y + iy as isize, bg);
                     }
                 }
             }
@@ -143,12 +162,13 @@ pub mod font {
             renderer: &mut R,
             x: isize,
             y: isize,
-            color: Color,
+            fg: Color,
+            bg: Option<Color>,
             s: &str,
         ) {
             let mut ix = 0;
             for c in s.chars() {
-                self.draw_char(renderer, x + ix, y, color, c);
+                self.draw_char(renderer, x + ix, y, fg, bg, c);
                 ix += 10;
             }
         }
