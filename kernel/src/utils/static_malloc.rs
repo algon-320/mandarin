@@ -25,10 +25,13 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
             return;
         }
 
-        let ptr = self.buf.as_mut_ptr();
-        unsafe { (ptr as *mut u8).write_bytes(0, BUF_SIZE) };
-        self.ptr = ptr as usize;
+        let ptr: *mut [u8; BUF_SIZE] = self.buf.as_mut_ptr();
+        unsafe {
+            ptr.write_bytes(0, 1) // fill the entire buffer with zeros
+        };
+        self.ptr = unsafe { (*ptr).as_mut_ptr() as usize };
         self.end = self.ptr + BUF_SIZE;
+
         self.initialized = true;
     }
 
@@ -36,11 +39,16 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
         (addr + align - 1) & !(align - 1)
     }
 
-    pub fn alloc(&mut self, size: usize, align: usize, boundary: usize) -> Option<NonNull<[u8]>> {
+    pub fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        boundary: Option<usize>,
+    ) -> Option<NonNull<[u8]>> {
         self.ensure_initialized();
 
         let mut ptr = Self::ceil(self.ptr, align);
-        let next_boundary = Self::ceil(self.ptr, boundary);
+        let next_boundary = Self::ceil(self.ptr, boundary.unwrap_or(self.default_boundary));
         if next_boundary < ptr + size {
             ptr = next_boundary;
         }
@@ -51,38 +59,44 @@ impl<const BUF_SIZE: usize> StaticMallocator<BUF_SIZE> {
             trace!("memory allocated: start={:#x}, size={:#x}", ptr, size);
             debug_assert!(!(ptr as *mut u8).is_null());
             self.ptr = ptr + size;
+
+            // NOTE: this is safe because these bytes are guaranteed to be initialized with 0
+            //       and the range is within self.buf (this is to say, it is a valid slice)
             Some(unsafe { NonNull::new_unchecked(slice_from_raw_parts_mut(ptr as *mut u8, size)) })
         }
     }
 
-    pub fn alloc_slice<T>(&mut self, len: usize) -> Option<NonNull<[MaybeUninit<T>]>> {
-        self.alloc_slice_ext::<T>(len, align_of::<T>(), self.default_boundary)
+    pub fn alloc_slice<T: 'static>(&mut self, len: usize) -> Option<NonNull<[MaybeUninit<T>]>> {
+        unsafe { self.alloc_slice_ext::<T>(len, align_of::<T>(), None) }
     }
-    pub fn alloc_slice_ext<T>(
+
+    /// Safety: `align` must be a multiple of `core::mem::align_of::<T>()`.
+    pub unsafe fn alloc_slice_ext<T: 'static>(
         &mut self,
         len: usize,
         align: usize,
-        boundary: usize,
+        boundary: Option<usize>,
     ) -> Option<NonNull<[MaybeUninit<T>]>> {
-        let ptr = self.alloc(size_of::<T>() * len, align, boundary)?;
-        Some(unsafe {
-            NonNull::new_unchecked(slice_from_raw_parts_mut(
-                (*ptr.as_ptr()).as_mut_ptr() as *mut MaybeUninit<T>,
-                len,
-            ))
-        })
+        debug_assert!(align % align_of::<T>() == 0);
+        let buf: &mut [u8] = self.alloc(size_of::<T>() * len, align, boundary)?.as_mut();
+        let ptr = buf.as_mut_ptr() as *mut MaybeUninit<T>;
+        Some(NonNull::new_unchecked(slice_from_raw_parts_mut(ptr, len)))
     }
 
-    pub fn alloc_obj<T>(&mut self) -> Option<NonNull<MaybeUninit<T>>> {
-        self.alloc_obj_ext::<T>(align_of::<T>(), self.default_boundary)
+    pub fn alloc_obj<T: 'static>(&mut self) -> Option<NonNull<MaybeUninit<T>>> {
+        unsafe { self.alloc_obj_ext::<T>(align_of::<T>(), None) }
     }
-    pub fn alloc_obj_ext<T>(
+
+    /// Safety: `align` must be a multiple of `core::mem::align_of::<T>()`.
+    pub unsafe fn alloc_obj_ext<T: 'static>(
         &mut self,
         align: usize,
-        boundary: usize,
+        boundary: Option<usize>,
     ) -> Option<NonNull<MaybeUninit<T>>> {
-        let ptr = self.alloc(size_of::<T>(), align, boundary)?;
-        Some(unsafe { NonNull::new_unchecked((*ptr.as_ptr()).as_mut_ptr() as *mut MaybeUninit<T>) })
+        debug_assert!(align % align_of::<T>() == 0);
+        let buf: &mut [u8] = self.alloc(size_of::<T>(), align, boundary)?.as_mut();
+        let obj = buf.as_mut_ptr() as *mut MaybeUninit<T>;
+        Some(NonNull::new_unchecked(obj))
     }
 }
 
@@ -102,25 +116,25 @@ mod tests {
             let ptr = MALLOC.alloc_obj::<u8>();
             assert_eq!(ptr.unwrap().as_ptr() as usize, buf_ptr + 1);
 
-            let ptr = MALLOC.alloc(1, 8, 1024);
+            let ptr = MALLOC.alloc(1, 8, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 8);
 
-            let ptr = MALLOC.alloc(1, 8, 1024);
+            let ptr = MALLOC.alloc(1, 8, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 16);
 
-            let ptr = MALLOC.alloc(1, 32, 1024);
+            let ptr = MALLOC.alloc(1, 32, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 32);
 
-            let ptr = MALLOC.alloc(1, 32, 1024);
+            let ptr = MALLOC.alloc(1, 32, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 64);
 
-            let ptr = MALLOC.alloc(62, 1, 1024);
+            let ptr = MALLOC.alloc(62, 1, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 65);
 
-            let ptr = MALLOC.alloc(4, 1, 128);
+            let ptr = MALLOC.alloc(4, 1, 128.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 128);
 
-            let ptr = MALLOC.alloc(64, 1024, 1024);
+            let ptr = MALLOC.alloc(64, 1024, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 1024);
         }
     }
@@ -131,7 +145,7 @@ mod tests {
         unsafe {
             let buf_ptr = MALLOC.buf.as_mut_ptr() as usize;
 
-            let ptr = MALLOC.alloc(1, 1, 1024);
+            let ptr = MALLOC.alloc(1, 1, 1024.into());
             assert_eq!((*ptr.unwrap().as_ptr()).as_ptr() as usize, buf_ptr + 0);
 
             #[repr(align(64))]

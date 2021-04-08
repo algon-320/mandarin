@@ -7,9 +7,10 @@ pub enum Error {
     InvalidPhase,
     InvalidSlotId,
     InvalidEndpointNumber,
+    InvalidEndpointType { ty: u8 },
     DeviceAlreadyAllocated,
     TransferRingNotSet,
-    TransferFailed,
+    TransferFailed { slot_id: u8 },
     NoCorrespondingSetupStage,
     NoWaiter,
     TooManyWaiters,
@@ -17,10 +18,21 @@ pub enum Error {
 }
 pub type Result<T> = core::result::Result<T, Error>;
 
+use crate::sync::spin::SpinMutex;
+use crate::utils::StaticMallocator;
+
+const MALLOC_BUF_SIZE: usize = 4 * 1024 * 1024; // 4MiB
+static MALLOC: SpinMutex<StaticMallocator<MALLOC_BUF_SIZE>> =
+    SpinMutex::new("usb/malloc", StaticMallocator::new());
+
 pub mod xhci {
-    use super::{Error, Result};
     use core::mem::{size_of, MaybeUninit};
     use core::ptr::{addr_of_mut, null, null_mut, NonNull};
+
+    use super::MALLOC;
+    use super::{Error, Result};
+    use crate::utils::{ArrayMap, ArrayMapError, FixedVec};
+    use trb::Trb;
 
     #[repr(transparent)]
     struct MemMapped<T>(T);
@@ -49,14 +61,26 @@ pub mod xhci {
 
             getter!(data: u32; 0xFF000000; u8, pub max_ports);
         }
+
         #[repr(C)]
         pub struct Hcsparams2 {
             data: u32,
         }
+        impl Hcsparams2 {
+            getter!(data: u32; 0x03E00000; u8, max_scratchpad_bufs_hi);
+            getter!(data: u32; 0xF8000000; u8, max_scratchpad_bufs_lo);
+
+            pub fn max_scratchpad_buf(&self) -> usize {
+                ((self.max_scratchpad_bufs_hi() as usize) << 5)
+                    | (self.max_scratchpad_bufs_lo() as usize)
+            }
+        }
+
         #[repr(C)]
         pub struct Hcsparams3 {
             data: u32,
         }
+
         #[repr(C)]
         pub struct Hccparams1 {
             data: u32,
@@ -375,7 +399,10 @@ pub mod xhci {
         reg: MemMapped<bitmap::Doorbell>,
     }
     impl DoorbellRegister {
-        pub fn ring(&mut self, target: u8, stream_id: u16) {
+        pub fn ring(&mut self, target: u8) {
+            self.ring_with_stream_id(target, 0)
+        }
+        pub fn ring_with_stream_id(&mut self, target: u8, stream_id: u16) {
             self.reg.modify_with(|reg| {
                 reg.set_db_target(target);
                 reg.set_db_stream_id(stream_id);
@@ -423,7 +450,7 @@ pub mod xhci {
             while unsafe { (*op_regs).usbsts.read().host_controller_halted() == 0 } {}
             debug!("host controller halted");
 
-            // Update the StaticMallocator's boundary to PAGESIZE
+            // Update the StaticMallocator's boundary with PAGESIZE
             let page_size = unsafe { (*op_regs).pagesize.read().page_size() };
             MALLOC.lock().default_boundary = page_size;
 
@@ -448,9 +475,47 @@ pub mod xhci {
                     config.set_max_device_slots_enabled(slots);
                 })
             };
-            let devmgr = DeviceManager::new(slots as usize, unsafe { doorbell_zero.add(1) })?;
 
-            // TODO: scratchpad buffers
+            let max_scratchpad_buffer_pages =
+                unsafe { (*cap_regs).hcsparams2.read().max_scratchpad_buf() };
+            let scratchpad_buffer_array_ptr = if max_scratchpad_buffer_pages > 0 {
+                debug!(
+                    "max scratchpad buffer: {} pages",
+                    max_scratchpad_buffer_pages
+                );
+                let mut malloc = MALLOC.lock();
+                let buf_arr: &mut [MaybeUninit<*const u8>] = unsafe {
+                    malloc
+                        .alloc_slice_ext::<*const u8>(
+                            max_scratchpad_buffer_pages,
+                            64,
+                            Some(page_size),
+                        )
+                        .ok_or(Error::NoEnoughMemory)?
+                        .as_mut()
+                };
+                for ptr in buf_arr.iter_mut() {
+                    let buf = unsafe {
+                        malloc
+                            .alloc(page_size, page_size, Some(page_size))
+                            .ok_or(Error::NoEnoughMemory)?
+                            .as_mut()
+                    };
+                    *ptr = MaybeUninit::new(buf.as_ptr());
+                }
+                let buf_arr = unsafe {
+                    core::mem::transmute::<&mut [MaybeUninit<*const u8>], &mut [*const u8]>(buf_arr)
+                };
+                buf_arr.as_ptr()
+            } else {
+                null()
+            };
+
+            let devmgr = DeviceManager::new(
+                slots as usize,
+                unsafe { doorbell_zero.add(1) },
+                scratchpad_buffer_array_ptr,
+            )?;
 
             let mut dcbaap = bitmap::Dcbaap::default();
             let device_contexts = devmgr.dcbaap();
@@ -488,12 +553,15 @@ pub mod xhci {
 
             // initialize ports
             let ports = {
-                let ports = MALLOC
-                    .lock()
-                    .alloc_slice::<Port>((max_ports + 1) as usize)
-                    .ok_or(Error::NoEnoughMemory)?;
                 let port_regs_origin = ((op_regs as usize) + 0x400) as *mut PortRegisterSet;
-                let ports: &mut [MaybeUninit<Port>] = unsafe { &mut *ports.as_ptr() };
+
+                let ports = unsafe {
+                    MALLOC
+                        .lock()
+                        .alloc_slice::<Port>((max_ports + 1) as usize)
+                        .ok_or(Error::NoEnoughMemory)?
+                        .as_mut()
+                };
                 ports[0] = MaybeUninit::zeroed();
                 for port_num in 1..=max_ports {
                     let port_regs = unsafe { port_regs_origin.add((port_num - 1) as usize) };
@@ -601,27 +669,6 @@ pub mod xhci {
                     }
                 }
             }
-            for port_num in 1..=self.max_ports {
-                if !self.ports[port_num as usize].is_connected() {
-                    continue;
-                }
-                if first == Some(port_num) {
-                    assert_eq!(
-                        self.ports[port_num as usize].config_phase(),
-                        PortConfigPhase::ResettingPort
-                    );
-                } else {
-                    assert_eq!(
-                        self.ports[port_num as usize].config_phase(),
-                        PortConfigPhase::WaitingAddressed
-                    );
-                }
-                debug!(
-                    "Port {}: {:?}",
-                    port_num,
-                    self.ports[port_num as usize].config_phase()
-                );
-            }
         }
 
         fn reset_port(&mut self, port_num: u8) -> Result<()> {
@@ -655,12 +702,14 @@ pub mod xhci {
             Ok(())
         }
 
-        fn ring_doorbell(&mut self) {
-            unsafe { (*self.doorbell_zero).ring(0, 0) };
+        fn ring_doorbell(doorbell: *mut DoorbellRegister) {
+            trace!("ring the doorbell zero (Command Ring)");
+            unsafe { (*doorbell).ring(0) };
         }
 
         fn enable_slot(&mut self, port_num: u8) -> Result<()> {
             let port = &mut self.ports[port_num as usize];
+
             let is_enabled = port.is_enabled();
             let reset_completed = port.is_port_reset_changed();
             trace!(
@@ -668,13 +717,14 @@ pub mod xhci {
                 is_enabled,
                 reset_completed
             );
+
             if is_enabled && reset_completed {
                 port.clear_port_reset_change();
                 port.set_config_phase(PortConfigPhase::EnablingSlot);
                 let cmd = trb::EnableSlotCommand::default();
                 trace!("EnableSlotCommand pushed");
-                self.cr.push(&cmd);
-                self.ring_doorbell();
+                self.cr.push(cmd.upcast());
+                Self::ring_doorbell(self.doorbell_zero);
             }
             Ok(())
         }
@@ -686,32 +736,18 @@ pub mod xhci {
 
             self.ports[port_num as usize].set_config_phase(PortConfigPhase::AddressingDevice);
             let mut cmd = trb::AddressDeviceCommand::default();
-            cmd.set_input_context_ptr(input_ctx as usize);
+            cmd.set_input_context_ptr(input_ctx);
             cmd.set_slot_id(slot_id);
-            self.cr.push(&cmd);
-            self.ring_doorbell();
+            self.cr.push(cmd.upcast());
+            Self::ring_doorbell(self.doorbell_zero);
 
             Ok(())
-        }
-
-        fn initialize_device(&mut self, port_num: u8, slot_id: u8) -> Result<()> {
-            trace!("initialize_device: port = {}, slot = {}", port_num, slot_id);
-
-            let dev = self
-                .devmgr
-                .find_by_slot_mut(slot_id)
-                .ok_or(Error::InvalidSlotId)?;
-            let port_num = dev.port_num();
-            self.ports[port_num as usize].set_config_phase(PortConfigPhase::InitializingDevice);
-
-            dev.start_initialize()
         }
 
         pub fn process_event(&mut self) -> Result<()> {
             if let Some(trb) = self.er.front() {
                 trace!("event found: TRB type = {}", trb.trb_type());
 
-                use trb::Trb;
                 match trb.trb_type() {
                     trb::TransferEvent::TYPE => self.on_transfer_event()?,
                     trb::CommandCompletionEvent::TYPE => self.on_command_completion_event()?,
@@ -743,11 +779,25 @@ pub mod xhci {
 
             dev.on_transfer_event_received(trb)?;
 
+            if let Some(cmd_trb) = dev.command_trb.take() {
+                debug!("command TRB found");
+                self.cr.push(&cmd_trb);
+                Self::ring_doorbell(self.doorbell_zero);
+            }
+
             if dev.is_initialized()
                 && self.ports[dev.port_num() as usize].config_phase()
                     == PortConfigPhase::InitializingDevice
             {
-                unimplemented!();
+                let input_ctx = dev.configure_endpoints()?;
+
+                self.ports[dev.port_num() as usize]
+                    .set_config_phase(PortConfigPhase::ConfiguringEndpoints);
+                let mut cmd = trb::ConfigureEndpointCommand::default();
+                cmd.set_input_context_ptr(input_ctx);
+                cmd.set_slot_id(slot_id);
+                self.cr.push(cmd.upcast());
+                Self::ring_doorbell(self.doorbell_zero);
             }
 
             Ok(())
@@ -769,7 +819,6 @@ pub mod xhci {
                 trb.completion_code()
             );
 
-            use trb::Trb;
             match issuer_type {
                 trb::EnableSlotCommand::TYPE => match self.addressing_port {
                     Some(port_num)
@@ -808,19 +857,68 @@ pub mod xhci {
                         Err(Error::InvalidPhase)
                     } else {
                         self.addressing_port = None;
+                        trace!("looking for the next port to address ...");
                         for i in 1..=self.max_ports {
                             if self.ports[i as usize].config_phase()
                                 == PortConfigPhase::WaitingAddressed
                             {
+                                trace!("the next port is port {}!", i);
                                 self.reset_port(i)?;
                                 break;
                             }
                         }
-                        self.initialize_device(port_num, slot_id)
+                        let dev = self
+                            .devmgr
+                            .find_by_slot_mut(slot_id)
+                            .ok_or(Error::InvalidSlotId)?;
+                        let port_num = dev.port_num();
+                        self.ports[port_num as usize]
+                            .set_config_phase(PortConfigPhase::InitializingDevice);
+                        dev.on_command_completion_event_received(issuer_type)?;
+                        if let Some(cmd_trb) = dev.command_trb.take() {
+                            debug!("command TRB found");
+                            self.cr.push(&cmd_trb);
+                            Self::ring_doorbell(self.doorbell_zero);
+                        }
+                        Ok(())
+                    }
+                }
+                trb::EvaluateContextCommand::TYPE => {
+                    let dev = self
+                        .devmgr
+                        .find_by_slot_mut(slot_id)
+                        .ok_or(Error::InvalidSlotId)?;
+                    let port_num = dev.port_num();
+                    if self.ports[port_num as usize].config_phase()
+                        != PortConfigPhase::InitializingDevice
+                    {
+                        Err(Error::InvalidPhase)
+                    } else {
+                        dev.on_command_completion_event_received(issuer_type)?;
+                        if let Some(cmd_trb) = dev.command_trb.take() {
+                            debug!("command TRB found");
+                            self.cr.push(&cmd_trb);
+                            Self::ring_doorbell(self.doorbell_zero);
+                        }
+                        Ok(())
                     }
                 }
                 trb::ConfigureEndpointCommand::TYPE => {
-                    unimplemented!();
+                    let dev = self
+                        .devmgr
+                        .find_by_slot_mut(slot_id)
+                        .ok_or(Error::InvalidSlotId)?;
+                    let port_num = dev.port_num();
+
+                    if self.ports[port_num as usize].config_phase()
+                        != PortConfigPhase::ConfiguringEndpoints
+                    {
+                        Err(Error::InvalidPhase)
+                    } else {
+                        dev.on_endpoints_configured()?;
+                        self.ports[port_num as usize].set_config_phase(PortConfigPhase::Configured);
+                        Ok(())
+                    }
                 }
                 _ => {
                     warn!("unexpected Event");
@@ -837,20 +935,19 @@ pub mod xhci {
                 .expect("TRB is not a PortStatusChangeEvent");
 
             let port_id = trb.port_id();
-            let port = &self.ports[port_id as usize];
+            let port = &mut self.ports[port_id as usize];
             trace!(
-                "PortStatusChangeEvent: port_id = {}, (CSC = {}, CCS = {}, PRC = {})",
+                "PortStatusChangeEvent: port_id = {}, phase = {:?}, (bits = {:032b})",
                 port_id,
-                port.is_connect_status_changed(),
-                port.is_connected(),
-                port.is_port_reset_changed(),
+                port.config_phase(),
+                port.bits(),
             );
             match port.config_phase() {
                 PortConfigPhase::NotConnected => {
                     if port.is_connect_status_changed() {
                         self.reset_port(port_id)
                     } else {
-                        trace!("skipping: port_id = {}", port_id);
+                        trace!("skipping reset_port: port_id = {}", port_id);
                         Ok(())
                     }
                 }
@@ -858,9 +955,13 @@ pub mod xhci {
                     if port.is_port_reset_changed() {
                         self.enable_slot(port_id)
                     } else {
-                        trace!("skipping: port_id = {}", port_id);
+                        trace!("skipping: enable_slot: port_id = {}", port_id);
                         Ok(())
                     }
+                }
+                PortConfigPhase::EnablingSlot => {
+                    trace!("skipping: port_id = {}", port_id);
+                    Ok(())
                 }
                 PortConfigPhase::WaitingAddressed => {
                     trace!("waiting addressed: port_id = {}", port_id);
@@ -868,10 +969,12 @@ pub mod xhci {
                 }
                 phase => {
                     warn!(
-                        "config_phase = {:?} (should be {:?} or {:?})",
+                        "config_phase = {:?} (should be {:?}, {:?}, {:?}, or {:?})",
                         phase,
                         PortConfigPhase::NotConnected,
                         PortConfigPhase::ResettingPort,
+                        PortConfigPhase::EnablingSlot,
+                        PortConfigPhase::WaitingAddressed,
                     );
                     Err(Error::InvalidPhase)
                 }
@@ -889,11 +992,13 @@ pub mod xhci {
     impl Ring {
         pub fn with_capacity(buf_size: usize) -> Result<Self> {
             // NOTE: for Transfer Rings, the alignment can be 16-bytes.
-            let buf = MALLOC
-                .lock()
-                .alloc_slice_ext::<GenericTrb>(buf_size, 64, 64 * 1024)
-                .ok_or(Error::NoEnoughMemory)?;
-            let buf: &mut [MaybeUninit<GenericTrb>] = unsafe { &mut *(buf.as_ptr()) };
+            let buf: &mut [MaybeUninit<GenericTrb>] = unsafe {
+                MALLOC
+                    .lock()
+                    .alloc_slice_ext::<GenericTrb>(buf_size, 64, Some(64 * 1024))
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
+            };
             for p in buf.iter_mut() {
                 *p = MaybeUninit::zeroed();
             }
@@ -923,21 +1028,20 @@ pub mod xhci {
             unsafe { p.add(3).write_volatile(trb.data[3]) };
         }
 
-        pub fn push<T: trb::Trb>(&mut self, trb: &T) -> &GenericTrb {
-            let trb: &GenericTrb = trb.upcast();
+        pub fn push(&mut self, trb: &trb::GenericTrb) -> &GenericTrb {
             self.copy_to_last(trb.clone());
             let written_idx = self.write_idx;
             self.write_idx += 1;
 
             if self.write_idx + 1 == self.buf.len() {
-                let mut link = trb::Link::default();
+                let mut link = trb::Link::new(self.buffer_ptr() as usize);
                 link.set_toggle_cycle(1);
                 let trb = <trb::Link as trb::Trb>::upcast(&link);
                 self.copy_to_last(trb.clone());
                 self.write_idx = 0;
                 self.cycle_bit = !self.cycle_bit;
             }
-            trace!("TRB pushed");
+            trace!("TRB (type: {}) pushed: {:?}", trb.trb_type(), trb);
             &self.buf[written_idx]
         }
     }
@@ -955,37 +1059,40 @@ pub mod xhci {
         pub fn with_capacity(buf_size: usize) -> Result<Self> {
             let mut malloc = MALLOC.lock();
 
-            let buf = malloc
-                .alloc_slice_ext::<GenericTrb>(buf_size, 64, 64 * 1024)
-                .ok_or(Error::NoEnoughMemory)?;
-            {
-                let buf: &mut [MaybeUninit<GenericTrb>] = unsafe { &mut *buf.as_ptr() };
-                for p in buf.iter_mut() {
-                    *p = MaybeUninit::zeroed();
-                }
+            let buf: &mut [MaybeUninit<GenericTrb>] = unsafe {
+                malloc
+                    .alloc_slice_ext::<GenericTrb>(buf_size, 64, Some(64 * 1024))
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
+            };
+            for p in buf.iter_mut() {
+                *p = MaybeUninit::zeroed();
             }
-            let buf = buf.as_ptr() as *const [GenericTrb];
+            let buf = unsafe {
+                core::mem::transmute::<&mut [MaybeUninit<GenericTrb>], &mut [GenericTrb]>(buf)
+            };
+            let buf = buf as *const [GenericTrb];
 
-            let table = malloc
-                .alloc_slice_ext::<EventRingSegmentTableEntry>(1, 64, 64 * 1024)
-                .ok_or(Error::NoEnoughMemory)?;
-            {
-                let table: &mut [_] = unsafe { &mut *table.as_ptr() };
-                for p in table.iter_mut() {
-                    *p = MaybeUninit::zeroed();
-                }
-                let table = unsafe {
-                    core::mem::transmute::<
-                        &mut [MaybeUninit<EventRingSegmentTableEntry>],
-                        &mut [EventRingSegmentTableEntry],
-                    >(table)
-                };
-                unsafe {
-                    table[0].set_pointer((*buf).as_ptr() as usize);
-                    table[0].set_ring_segment_size((*buf).len() as u16);
-                }
+            let table: &mut [MaybeUninit<EventRingSegmentTableEntry>] = unsafe {
+                malloc
+                    .alloc_slice_ext::<EventRingSegmentTableEntry>(1, 64, Some(64 * 1024))
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
+            };
+            for p in table.iter_mut() {
+                *p = MaybeUninit::zeroed();
             }
-            let table = table.as_ptr() as *const [EventRingSegmentTableEntry];
+            let table = unsafe {
+                core::mem::transmute::<
+                    &mut [MaybeUninit<EventRingSegmentTableEntry>],
+                    &mut [EventRingSegmentTableEntry],
+                >(table)
+            };
+            unsafe {
+                table[0].set_pointer((*buf).as_ptr() as usize);
+                table[0].set_ring_segment_size((*buf).len() as u16);
+            }
+            let table = table as *const [EventRingSegmentTableEntry];
 
             Ok(Self {
                 buf,
@@ -1092,6 +1199,7 @@ pub mod xhci {
             EnableSlotCommand = 9,
             AddressDeviceCommand = 11,
             ConfigureEndpointCommand = 12,
+            EvaluateContextCommand = 13,
 
             TransferEvent = 32,
             CommandCompletionEvent = 33,
@@ -1156,6 +1264,43 @@ pub mod xhci {
         #[repr(C, align(16))]
         pub struct Normal {
             data: [u32; 4],
+        }
+        impl Normal {
+            getter!(data[0]: u32; 0xFFFFFFFF; u32, data_buffer_lo);
+            setter!(data[0]: u32; 0xFFFFFFFF; u32, set_data_buffer_lo);
+            getter!(data[1]: u32; 0xFFFFFFFF; u32, data_buffer_hi);
+            setter!(data[1]: u32; 0xFFFFFFFF; u32, set_data_buffer_hi);
+
+            getter!(data[2]: u32; 0x0001FFFF; u32, pub trb_transfer_length);
+            setter!(data[2]: u32; 0x0001FFFF; u32, pub set_trb_transfer_length);
+
+            getter!(data[2]: u32; 0x003E0000; u32, pub td_size);
+            setter!(data[2]: u32; 0x003E0000; u32, pub set_td_size);
+
+            getter!(data[3]: u32; 0x00000004;  u8, pub interrupt_on_short_packet);
+            setter!(data[3]: u32; 0x00000004;  u8, pub set_interrupt_on_short_packet);
+
+            getter!(data[3]: u32; 0x00000020;  u8, pub interrupt_on_completion);
+            setter!(data[3]: u32; 0x00000020;  u8, pub set_interrupt_on_completion);
+
+            setter!(data[3]: u32; 0x0000FC00;  u8, set_trb_type);
+
+            pub fn data_buffer(&self) -> *mut u8 {
+                (((self.data_buffer_hi() as usize) << 32) | (self.data_buffer_lo() as usize))
+                    as *mut u8
+            }
+            pub fn set_data_buffer(&mut self, ptr: *mut u8) {
+                let ptr = ptr as usize;
+                self.set_data_buffer_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
+                self.set_data_buffer_lo(((ptr & 0x00000000FFFFFFFF) >> 00) as u32);
+            }
+        }
+        impl Default for Normal {
+            fn default() -> Self {
+                let mut trb = Self { data: [0; 4] };
+                trb.set_trb_type(Self::TYPE);
+                trb
+            }
         }
         impl Trb for Normal {
             const TYPE: u8 = TypeId::Normal as u8;
@@ -1249,29 +1394,29 @@ pub mod xhci {
             getter!(data[3]: u32; 0x00010000;  u8, pub direction);
             setter!(data[3]: u32; 0x00010000;  u8, pub set_direction);
 
-            pub fn data_buffer(&self) -> *const u8 {
+            pub fn data_buffer(&self) -> *mut u8 {
                 (((self.data_buffer_hi() as usize) << 32) | (self.data_buffer_lo() as usize))
-                    as *const u8
+                    as *mut u8
             }
-            pub fn set_data_buffer(&mut self, ptr: *const u8) {
+            pub fn set_data_buffer(&mut self, ptr: *mut u8) {
                 let ptr = ptr as usize;
                 self.set_data_buffer_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
                 self.set_data_buffer_lo(((ptr & 0x00000000FFFFFFFF) >> 00) as u32);
             }
 
-            fn new(buf: &[u8], dir_in: bool) -> Self {
+            fn new(buf: *mut u8, len: usize, dir_in: bool) -> Self {
                 let mut trb = Self::default();
-                trb.set_data_buffer(buf.as_ptr());
-                trb.set_trb_transfer_length(buf.len() as u32);
+                trb.set_data_buffer(buf);
+                trb.set_trb_transfer_length(len as u32);
                 trb.set_td_size(0);
                 trb.set_direction(dir_in as u8);
                 trb
             }
-            pub fn new_out(buf: &[u8]) -> Self {
-                Self::new(buf, false)
+            pub fn new_out(buf: *const u8, len: usize) -> Self {
+                Self::new(buf as *mut u8, len, false)
             }
-            pub fn new_in(buf: &[u8]) -> Self {
-                Self::new(buf, true)
+            pub fn new_in(buf: *mut u8, len: usize) -> Self {
+                Self::new(buf, len, true)
             }
         }
         impl Default for DataStage {
@@ -1314,8 +1459,30 @@ pub mod xhci {
             data: [u32; 4],
         }
         impl Link {
+            getter!(data[0]: u32; 0xFFFFFFF0; u32, ring_segment_pointer_lo);
+            setter!(data[0]: u32; 0xFFFFFFF0; u32, set_ring_segment_pointer_lo);
+            getter!(data[1]: u32; 0xFFFFFFFF; u32, ring_segment_pointer_hi);
+            setter!(data[1]: u32; 0xFFFFFFFF; u32, set_ring_segment_pointer_hi);
+
             setter!(data[3]: u32; 0x00000002; u8, pub set_toggle_cycle);
             setter!(data[3]: u32; 0x0000FC00; u8, set_trb_type);
+
+            pub fn ring_segment_pointer(&self) -> usize {
+                (((self.ring_segment_pointer_hi() as u64) << 32)
+                    | ((self.ring_segment_pointer_lo() << 4) as u64)) as usize
+            }
+            pub fn set_ring_segment_pointer(&mut self, ptr: usize) {
+                let ptr = ptr as u64;
+                debug_assert!(ptr & 0xF == 0);
+                self.set_ring_segment_pointer_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
+                self.set_ring_segment_pointer_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
+            }
+
+            pub fn new(next_ring_segment_ptr: usize) -> Self {
+                let mut trb = Self::default();
+                trb.set_ring_segment_pointer(next_ring_segment_ptr);
+                trb
+            }
         }
         impl Default for Link {
             fn default() -> Self {
@@ -1361,14 +1528,15 @@ pub mod xhci {
             getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
             setter!(data[3]: u32; 0xFF000000;  u8, pub set_slot_id);
 
-            pub fn input_context_ptr(&self) -> usize {
+            pub(super) fn input_context_ptr(&self) -> *const super::InputContext {
                 (((self.input_ctx_ptr_hi() as u64) << 32) | ((self.input_ctx_ptr_lo() << 4) as u64))
-                    as usize
+                    as usize as *const super::InputContext
             }
-            pub fn set_input_context_ptr(&mut self, ptr: usize) {
+            pub(super) fn set_input_context_ptr(&mut self, ptr: *const super::InputContext) {
+                let ptr = ptr as usize as u64;
                 debug_assert!(ptr & 0xF == 0);
-                self.set_input_ctx_ptr_lo((((ptr as u64) & 0x00000000FFFFFFFF) >> 4) as u32);
-                self.set_input_ctx_ptr_hi((((ptr as u64) & 0xFFFFFFFF00000000) >> 32) as u32);
+                self.set_input_ctx_ptr_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
+                self.set_input_ctx_ptr_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
             }
         }
         impl Default for AddressDeviceCommand {
@@ -1387,10 +1555,73 @@ pub mod xhci {
             data: [u32; 4],
         }
         impl ConfigureEndpointCommand {
-            // TODO
+            getter!(data[0]: u32; 0xFFFFFFF0; u32, input_ctx_ptr_lo);
+            setter!(data[0]: u32; 0xFFFFFFF0; u32, set_input_ctx_ptr_lo);
+            getter!(data[1]: u32; 0xFFFFFFFF; u32, input_ctx_ptr_hi);
+            setter!(data[1]: u32; 0xFFFFFFFF; u32, set_input_ctx_ptr_hi);
+
+            setter!(data[3]: u32; 0x0000FC00;  u8, set_trb_type);
+
+            getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
+            setter!(data[3]: u32; 0xFF000000;  u8, pub set_slot_id);
+
+            pub(super) fn input_context_ptr(&self) -> *const super::InputContext {
+                (((self.input_ctx_ptr_hi() as u64) << 32) | ((self.input_ctx_ptr_lo() << 4) as u64))
+                    as usize as *const super::InputContext
+            }
+            pub(super) fn set_input_context_ptr(&mut self, ptr: *const super::InputContext) {
+                let ptr = ptr as usize as u64;
+                debug_assert!(ptr & 0xF == 0);
+                self.set_input_ctx_ptr_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
+                self.set_input_ctx_ptr_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
+            }
+        }
+        impl Default for ConfigureEndpointCommand {
+            fn default() -> Self {
+                let mut trb = Self { data: [0; 4] };
+                trb.set_trb_type(Self::TYPE);
+                trb
+            }
         }
         impl Trb for ConfigureEndpointCommand {
             const TYPE: u8 = TypeId::ConfigureEndpointCommand as u8;
+        }
+
+        #[repr(C, align(16))]
+        pub struct EvaluateContextCommand {
+            data: [u32; 4],
+        }
+        impl EvaluateContextCommand {
+            getter!(data[0]: u32; 0xFFFFFFF0; u32, input_ctx_ptr_lo);
+            setter!(data[0]: u32; 0xFFFFFFF0; u32, set_input_ctx_ptr_lo);
+            getter!(data[1]: u32; 0xFFFFFFFF; u32, input_ctx_ptr_hi);
+            setter!(data[1]: u32; 0xFFFFFFFF; u32, set_input_ctx_ptr_hi);
+
+            setter!(data[3]: u32; 0x0000FC00;  u8, set_trb_type);
+
+            getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
+            setter!(data[3]: u32; 0xFF000000;  u8, pub set_slot_id);
+
+            pub(super) fn input_context_ptr(&self) -> *const super::InputContext {
+                (((self.input_ctx_ptr_hi() as u64) << 32) | ((self.input_ctx_ptr_lo() << 4) as u64))
+                    as usize as *const super::InputContext
+            }
+            pub(super) fn set_input_context_ptr(&mut self, ptr: *const super::InputContext) {
+                let ptr = ptr as usize as u64;
+                debug_assert!(ptr & 0xF == 0);
+                self.set_input_ctx_ptr_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
+                self.set_input_ctx_ptr_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
+            }
+        }
+        impl Default for EvaluateContextCommand {
+            fn default() -> Self {
+                let mut trb = Self { data: [0; 4] };
+                trb.set_trb_type(Self::TYPE);
+                trb
+            }
+        }
+        impl Trb for EvaluateContextCommand {
+            const TYPE: u8 = TypeId::EvaluateContextCommand as u8;
         }
 
         #[repr(C, align(16))]
@@ -1467,10 +1698,7 @@ pub mod xhci {
         setter!(data[1]: u32; 0x00FF0000;  u8, pub set_root_hub_port_number);
     }
 
-    #[repr(u8)]
-    enum EndpointType {
-        Control = 4,
-    }
+    use super::EndpointType;
 
     #[repr(C, align(32))]
     struct EndpointContext {
@@ -1506,6 +1734,9 @@ pub mod xhci {
         getter!(data[3]: u32; 0xFFFFFFFF; u32, dequeue_pointer_hi);
         setter!(data[3]: u32; 0xFFFFFFFF; u32, set_dequeue_pointer_hi);
 
+        getter!(data[4]: u32; 0x0000FFFF; u16, pub average_trb_length);
+        setter!(data[4]: u32; 0x0000FFFF; u16, pub set_average_trb_length);
+
         pub fn set_transfer_ring_buffer(&mut self, ptr: usize) {
             self.set_dequeue_pointer_lo((((ptr as u64) & 0x00000000FFFFFFFF) >> 4) as u32);
             self.set_dequeue_pointer_hi((((ptr as u64) & 0xFFFFFFFF00000000) >> 32) as u32);
@@ -1531,8 +1762,8 @@ pub mod xhci {
 
     #[repr(C, align(64))]
     struct DeviceContext {
-        slot_context: SlotContext,
-        ep_contexts: [EndpointContext; 31],
+        slot_ctx: SlotContext,
+        ep_ctxs: [EndpointContext; 31],
     }
     impl DeviceContext {
         pub unsafe fn initialize_ptr(ptr: *mut Self) {
@@ -1551,6 +1782,7 @@ pub mod xhci {
         alternate_setting: u8,
         _reserved2: u8,
     }
+
     #[repr(C, align(64))]
     struct InputContext {
         input_control_ctx: InputControlContext,
@@ -1563,12 +1795,10 @@ pub mod xhci {
             ptr.write_bytes(0, size_of::<Self>());
         }
         pub fn enable_slot_context(&mut self) -> &mut SlotContext {
-            assert_eq!(size_of::<InputControlContext>(), 32);
-            assert_eq!(size_of::<SlotContext>(), 32);
             self.input_control_ctx.add_context_flags |= 1;
             &mut self.slot_ctx
         }
-        pub fn enable_endpoint(&mut self, dci: DeviceContextIndex) -> &mut EndpointContext {
+        pub fn update_endpoint(&mut self, dci: DeviceContextIndex) -> &mut EndpointContext {
             self.input_control_ctx.add_context_flags |= 1 << dci.0;
             &mut self.ep_ctxs[dci.0 - 1]
         }
@@ -1584,34 +1814,69 @@ pub mod xhci {
     use super::{
         class_driver, descriptor, request_type, EndpointConfig, EndpointId, Request, SetupData,
     };
-    use crate::utils::{ArrayMap, ArrayMapError};
-    use descriptor::{ConfigurationDescriptor, Descriptor, DeviceDescriptor, InterfaceDescriptor};
-
-    use crate::utils::FixedVec;
+    use descriptor::{
+        ConfigurationDescriptor, Descriptor, DeviceDescriptor, EndpointDescriptor, HidDescriptor,
+        InterfaceDescriptor,
+    };
 
     pub struct Device {
         ctx: *const DeviceContext,
         input_ctx: InputContext,
-        state: DeviceState,
         doorbell: *mut DoorbellRegister,
         transfer_rings: [Option<TransferRing>; 31],
+        command_trb: Option<GenericTrb>,
+        slot_id: u8,
+        speed: PortSpeed,
 
-        is_initialized: bool,
-        init_phase: u8,
-        buf: [u8; 256],
+        buf: Option<NonNull<[u8]>>,
+        init_phase: i8,
         num_configurations: u8,
         config_index: u8,
         ep_configs: FixedVec<EndpointConfig, 16>,
-        num_ep_configs: usize,
-        event_waiters: ArrayMap<SetupData, *mut dyn class_driver::Driver, 4>,
+        class_drivers: FixedVec<&'static mut dyn class_driver::Driver, 16>,
+
+        /// EP number --> class driver index
+        class_driver_idxs: [Option<usize>; 16],
+
+        /// Setup Data --> class driver index
+        event_waiters: ArrayMap<SetupData, usize, 4>,
+
+        /// {DataStage,StatusStage} TRB --> SetupStage TRB
         setup_stage_map: ArrayMap<*const trb::GenericTrb, *const trb::SetupStage, 16>,
     }
 
     impl Device {
+        fn detach_buf(&mut self) -> NonNull<u8> {
+            let ptr = self.buf.take().expect("ownership error");
+            unsafe { NonNull::new_unchecked((*ptr.as_ptr()).as_mut_ptr()) }
+        }
+
+        /// Safety: `buf_ptr` must be a pointer which is derived from `detach_buf`.
+        unsafe fn attach_buf(&mut self, buf_ptr: NonNull<u8>) {
+            debug_assert!(self.buf.is_none());
+            let buf = NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+                buf_ptr.as_ptr(),
+                Self::BUF_SIZE,
+            ));
+            self.buf = Some(buf);
+        }
+
+        fn slice<'a, R>(buf: &'a mut Option<NonNull<[u8]>>, range: R) -> &'a mut [u8]
+        where
+            R: core::ops::RangeBounds<usize> + core::slice::SliceIndex<[u8], Output = [u8]>,
+        {
+            unsafe { &mut buf.as_mut().expect("ownership error").as_mut()[range] }
+        }
+    }
+
+    impl Device {
+        const BUF_SIZE: usize = 1024;
+
         unsafe fn initialize_ptr(
             ptr: *mut Self,
             ctx: *const DeviceContext,
             doorbell: *mut DoorbellRegister,
+            slot_id: u8,
             port: &Port,
         ) -> Result<*const InputContext> {
             {
@@ -1620,9 +1885,6 @@ pub mod xhci {
 
                 let input_ctx_ptr = addr_of_mut!((*ptr).input_ctx);
                 InputContext::initialize_ptr(input_ctx_ptr);
-
-                let state_ptr = addr_of_mut!((*ptr).state);
-                state_ptr.write(DeviceState::Blank);
 
                 let doorbell_ptr = addr_of_mut!((*ptr).doorbell);
                 doorbell_ptr.write(doorbell);
@@ -1633,14 +1895,26 @@ pub mod xhci {
                     transfer_rings_ptr.add(i).write(None);
                 }
 
-                let is_initialized_ptr = addr_of_mut!((*ptr).is_initialized);
-                is_initialized_ptr.write(false);
+                let command_trb_ptr = addr_of_mut!((*ptr).command_trb);
+                command_trb_ptr.write(None);
+
+                let slot_id_ptr = addr_of_mut!((*ptr).slot_id);
+                slot_id_ptr.write(slot_id);
+
+                let speed_ptr = addr_of_mut!((*ptr).speed);
+                speed_ptr.write(port.speed());
 
                 let init_phase_ptr = addr_of_mut!((*ptr).init_phase);
-                init_phase_ptr.write(0);
+                init_phase_ptr.write(-1);
 
-                let buf_ptr: *mut [u8; 256] = addr_of_mut!((*ptr).buf);
-                buf_ptr.write_bytes(0, 1);
+                let buf_ptr: *mut Option<NonNull<[u8]>> = addr_of_mut!((*ptr).buf);
+                {
+                    let buf: NonNull<[u8]> = MALLOC
+                        .lock()
+                        .alloc(Self::BUF_SIZE, 64, None)
+                        .ok_or(Error::NoEnoughMemory)?;
+                    buf_ptr.write(Some(buf));
+                }
 
                 let num_configurations_ptr = addr_of_mut!((*ptr).num_configurations);
                 num_configurations_ptr.write(0);
@@ -1650,6 +1924,15 @@ pub mod xhci {
 
                 let ep_configs_ptr = addr_of_mut!((*ptr).ep_configs);
                 FixedVec::initialize_ptr(ep_configs_ptr);
+
+                let class_drivers_ptr = addr_of_mut!((*ptr).class_drivers);
+                FixedVec::initialize_ptr(class_drivers_ptr);
+
+                let class_driver_idxs_ptr =
+                    addr_of_mut!((*ptr).class_driver_idxs) as *mut Option<usize>;
+                for i in 0..16 {
+                    class_driver_idxs_ptr.add(i).write(None);
+                }
 
                 let event_waiters_ptr = addr_of_mut!((*ptr).event_waiters);
                 ArrayMap::initialize_ptr(event_waiters_ptr);
@@ -1665,12 +1948,16 @@ pub mod xhci {
             slot_ctx.set_context_entries(1);
             slot_ctx.set_speed(port.speed() as u8);
 
-            let ep0_dci = DeviceContextIndex::new_out(0);
+            let ep0_dci = EndpointId::DEFAULT_CONTROL_PIPE.into();
             let tr_buf = device.alloc_transfer_ring(ep0_dci, 32)?.buffer_ptr();
             let max_packet_size = port.speed().determine_max_packet_size_for_control_pipe();
-            debug!("max_packet_size = {}", max_packet_size);
+            debug!(
+                "port.speed() = {:?}, max_packet_size = {}",
+                port.speed(),
+                max_packet_size
+            );
 
-            let ep0_ctx = device.input_ctx.enable_endpoint(ep0_dci);
+            let ep0_ctx = device.input_ctx.update_endpoint(ep0_dci);
             ep0_ctx.set_endpoint_type(EndpointType::Control as u8);
             ep0_ctx.set_max_packet_size(max_packet_size);
             ep0_ctx.set_max_burst_size(0);
@@ -1695,125 +1982,179 @@ pub mod xhci {
         }
 
         fn port_num(&self) -> u8 {
-            unsafe { (*self.ctx).slot_context.root_hub_port_number() }
-        }
-    }
-
-    impl Device {
-        fn is_initialized(&self) -> bool {
-            self.is_initialized
+            unsafe { (*self.ctx).slot_ctx.root_hub_port_number() }
         }
 
-        fn start_initialize(&mut self) -> Result<()> {
-            self.is_initialized = false;
-            self.init_phase = 1;
-            self.get_descriptor(
-                EndpointId::DEFAULT_CONTROL_PIPE,
-                <DeviceDescriptor as Descriptor>::TYPE,
-                0,
-            )
+        pub fn is_initialized(&self) -> bool {
+            self.init_phase == 4
+        }
+
+        fn initialize_phase0(&mut self, transfered_size: usize) -> Result<()> {
+            debug_assert_eq!(transfered_size, 8);
+            trace!("initialize_phase0 on slot_id={}", self.slot_id);
+
+            debug_assert_eq!(Self::slice(&mut self.buf, ..).len(), Self::BUF_SIZE);
+            let device_desc =
+                descriptor::from_bytes::<DeviceDescriptor>(Self::slice(&mut self.buf, ..8))
+                    .unwrap();
+            debug!("USB release = {:04x}", device_desc.usb_release as u16);
+            let ep0_ctx = self
+                .input_ctx
+                .update_endpoint(EndpointId::DEFAULT_CONTROL_PIPE.into());
+            let max_packet_size = if device_desc.usb_release >= 0x0300 {
+                (1 << device_desc.max_packet_size) as u16
+            } else {
+                device_desc.max_packet_size as u16
+            };
+            debug!(
+                "update max_packet_size: {} => {}",
+                ep0_ctx.max_packet_size(),
+                max_packet_size
+            );
+            ep0_ctx.set_max_packet_size(max_packet_size);
+            let mut eval_ctx_cmd = trb::EvaluateContextCommand::default();
+            eval_ctx_cmd.set_input_context_ptr(&self.input_ctx);
+            eval_ctx_cmd.set_slot_id(self.slot_id);
+            self.command_trb = Some(eval_ctx_cmd.upcast().clone());
+
+            Ok(())
         }
 
         fn initialize_phase1(&mut self, transfered_size: usize) -> Result<()> {
-            let device_desc = descriptor::from_bytes::<DeviceDescriptor>(&self.buf[..]).unwrap();
+            trace!("initialize_phase1 on slot_id={}", self.slot_id);
+            debug_assert_eq!(transfered_size, 18);
+            let device_desc =
+                descriptor::from_bytes::<DeviceDescriptor>(Self::slice(&mut self.buf, ..18))
+                    .unwrap();
+
             self.num_configurations = device_desc.num_configurations;
             debug!("num_configurations = {}", self.num_configurations);
+
             self.config_index = 0;
             self.init_phase = 2;
             debug!(
                 "issuing Get Config Descriptor: index = {}",
                 self.config_index
             );
+
             self.get_descriptor(
                 EndpointId::DEFAULT_CONTROL_PIPE,
-                <ConfigurationDescriptor as Descriptor>::TYPE,
+                ConfigurationDescriptor::TYPE,
                 self.config_index,
+                Self::BUF_SIZE,
             )
         }
+
         fn initialize_phase2(&mut self, transfered_size: usize) -> Result<()> {
-            assert!(descriptor::from_bytes::<ConfigurationDescriptor>(&self.buf[..]).is_some());
+            trace!("initialize_phase2 on slot_id={}", self.slot_id);
+            let buf = Self::slice(&mut self.buf, ..);
 
-            struct IfaceIter<'buf> {
-                buf: &'buf [u8],
-            }
-            impl<'buf> IfaceIter<'buf> {
-                fn new(conf_desc: &'buf [u8]) -> Self {
-                    Self { buf: conf_desc }
-                }
-            }
-            impl<'buf> Iterator for IfaceIter<'buf> {
-                type Item = &'buf InterfaceDescriptor;
-                fn next(&mut self) -> Option<Self::Item> {
-                    loop {
-                        let sz = self.buf[0] as usize;
-                        if self.buf.len() < sz {
-                            return None;
-                        }
-                        self.buf = &self.buf[sz..];
-                        if let Some(desc) = descriptor::from_bytes(self.buf) {
-                            return Some(desc);
-                        }
-                    }
-                }
-            }
+            // TODO: handle the case where total_length > BUF_SIZE
+            assert_eq!(
+                descriptor::from_bytes::<ConfigurationDescriptor>(buf)
+                    .unwrap()
+                    .total_length as usize,
+                transfered_size
+            );
 
-            let device = self as *mut Self; // FIXME: UNSAFE
-            let mut class_driver: Option<NonNull<dyn class_driver::Driver + 'static>> = None;
-            for if_desc in IfaceIter::new(&self.buf[..transfered_size]) {
-                match Self::new_class_driver(device, if_desc) {
-                    Ok(driver) => class_driver = Some(driver),
+            let mut desc_itr =
+                descriptor::DescIter::new(Self::slice(&mut self.buf, ..transfered_size));
+            while let Some(if_desc) = desc_itr.next::<InterfaceDescriptor>() {
+                let class_driver = match Self::new_class_driver(if_desc) {
+                    Ok(driver) => driver,
                     Err(Error::UnsupportedInterface) => continue,
                     Err(e) => return Err(e),
-                }
+                };
 
                 self.ep_configs.clear();
-                todo!(); // collect endpoint descriptors
-            }
-
-            let conf_desc =
-                descriptor::from_bytes::<ConfigurationDescriptor>(&self.buf[..]).unwrap();
-
-            match class_driver {
-                None => Ok(()),
-                Some(driver) => {
-                    self.init_phase = 3;
-                    debug!(
-                        "issuing Set Configuration: conf_val = {}",
-                        conf_desc.configuration_value
-                    );
-                    let conf_val = conf_desc.configuration_value;
-                    self.set_configuration(EndpointId::DEFAULT_CONTROL_PIPE, conf_val)
+                let class_driver_idx = self.class_drivers.push(class_driver).unwrap();
+                debug!("if_desc.num_endpoints = {}", if_desc.num_endpoints);
+                while self.ep_configs.len() < if_desc.num_endpoints as usize {
+                    if let Some(ep_desc) = desc_itr.next::<EndpointDescriptor>() {
+                        let conf = EndpointConfig::from(ep_desc);
+                        debug!("{:?}", conf);
+                        let ep_id = conf.ep_id;
+                        self.ep_configs.push(conf);
+                        self.class_driver_idxs[ep_id.number() as usize] = Some(class_driver_idx);
+                    } else if let Some(hid_desc) = desc_itr.next::<HidDescriptor>() {
+                        debug!("{:?}", hid_desc);
+                    }
                 }
+                self.init_phase = 3;
+
+                let conf_desc = descriptor::from_bytes::<ConfigurationDescriptor>(Self::slice(
+                    &mut self.buf,
+                    ..,
+                ))
+                .unwrap();
+                debug!(
+                    "issuing Set Configuration: conf_val = {}",
+                    conf_desc.configuration_value
+                );
+                let conf_val = conf_desc.configuration_value;
+
+                return self.set_configuration(EndpointId::DEFAULT_CONTROL_PIPE, conf_val);
             }
+
+            warn!("supported class driver not found");
+            Ok(())
+        }
+
+        fn initialize_phase3(&mut self, config_value: u8) -> Result<()> {
+            trace!("initialize_phase3 on slot_id={}", self.slot_id);
+            for conf in self.ep_configs.iter() {
+                let driver_idx = self.class_driver_idxs[conf.ep_id.number() as usize];
+                self.class_drivers
+                    .get_mut(driver_idx.unwrap())
+                    .unwrap()
+                    .set_endpoint(conf)?;
+            }
+            self.init_phase = 4;
+            debug!("slot_id = {}: initialized", self.slot_id);
+            Ok(())
         }
 
         fn new_class_driver(
-            device: *mut Self,
             if_desc: &InterfaceDescriptor,
-        ) -> Result<NonNull<dyn class_driver::Driver + 'static>> {
+        ) -> Result<&'static mut dyn class_driver::Driver> {
             let class = if_desc.interface_class;
             let sub = if_desc.interface_sub_class;
             let proto = if_desc.interface_protocol;
             match (class, sub, proto) {
                 (3, 1, 1) => {
                     info!("keyboard");
-                    unimplemented!();
+                    use class_driver::HidKeyboardDriver;
+                    let keyboard_driver = unsafe {
+                        let keyboard_driver: &mut MaybeUninit<HidKeyboardDriver> = MALLOC
+                            .lock()
+                            .alloc_obj::<HidKeyboardDriver>()
+                            .ok_or(Error::NoEnoughMemory)?
+                            .as_mut();
+                        keyboard_driver
+                            .as_mut_ptr()
+                            .write(HidKeyboardDriver::new(if_desc.interface_number)?);
+                        core::mem::transmute::<
+                            &mut MaybeUninit<HidKeyboardDriver>,
+                            &mut HidKeyboardDriver,
+                        >(keyboard_driver)
+                    };
+                    Ok(keyboard_driver)
                 }
                 (3, 1, 2) => {
                     info!("mouse");
+                    use class_driver::HidMouseDriver;
                     let mouse_driver = unsafe {
-                        let mouse_driver = MALLOC
+                        let mouse_driver: &mut MaybeUninit<HidMouseDriver> = MALLOC
                             .lock()
-                            .alloc_obj::<class_driver::HidMouseDriver>()
-                            .ok_or(Error::NoEnoughMemory)?;
-                        (*mouse_driver.as_ptr()).as_mut_ptr().write(
-                            class_driver::HidMouseDriver::new(device, if_desc.interface_number),
-                        );
-                        let tmp = core::mem::transmute::<
-                            NonNull<MaybeUninit<class_driver::HidMouseDriver>>,
-                            NonNull<class_driver::HidMouseDriver>,
-                        >(mouse_driver);
-                        NonNull::new_unchecked(&mut *tmp.as_ptr())
+                            .alloc_obj::<HidMouseDriver>()
+                            .ok_or(Error::NoEnoughMemory)?
+                            .as_mut();
+                        mouse_driver
+                            .as_mut_ptr()
+                            .write(HidMouseDriver::new(if_desc.interface_number)?);
+                        core::mem::transmute::<&mut MaybeUninit<HidMouseDriver>, &mut HidMouseDriver>(
+                            mouse_driver,
+                        )
                     };
                     Ok(mouse_driver)
                 }
@@ -1821,21 +2162,150 @@ pub mod xhci {
             }
         }
 
-        fn on_transfer_event_received(&mut self, trb: &trb::TransferEvent) -> Result<()> {
-            if trb.completion_code() != 1 /* Success */ && trb.completion_code() != 13
-            /* Short Packet*/
+        fn configure_endpoints(&mut self) -> Result<*const InputContext> {
             {
-                use trb::Trb;
-                debug!(
-                    "on_transfer_event_received: invalid trb = {:?}",
-                    trb.upcast()
-                );
-                return Err(Error::TransferFailed);
+                let input_ctrl_ctx_ptr: *mut u8 =
+                    &mut self.input_ctx.input_control_ctx as *mut _ as *mut u8;
+                unsafe { input_ctrl_ctx_ptr.write_bytes(0, size_of::<InputControlContext>()) };
+
+                let src = unsafe { &(*self.ctx).slot_ctx as *const SlotContext };
+                let dst = &mut self.input_ctx.slot_ctx as *mut SlotContext;
+                unsafe { core::ptr::copy(src, dst, 1) };
             }
 
+            let slot_ctx = self.input_ctx.enable_slot_context();
+            slot_ctx.set_context_entries(31);
+
+            for i in 0..self.ep_configs.len() {
+                let ep_dci = DeviceContextIndex::from(self.ep_configs.get(i).unwrap().ep_id);
+                let tr_buf_ptr = self.alloc_transfer_ring(ep_dci, 32)?.buffer_ptr();
+
+                let config = self.ep_configs.get(i).unwrap();
+                let ep_ctx = self.input_ctx.update_endpoint(ep_dci);
+
+                match config.ep_type {
+                    EndpointType::Control => {
+                        ep_ctx.set_endpoint_type(4);
+                    }
+                    EndpointType::Isochronous => {
+                        ep_ctx.set_endpoint_type(if config.ep_id.is_in() { 5 } else { 1 });
+                    }
+                    EndpointType::Bulk => {
+                        ep_ctx.set_endpoint_type(if config.ep_id.is_in() { 6 } else { 2 });
+                    }
+                    EndpointType::Interrupt => {
+                        ep_ctx.set_endpoint_type(if config.ep_id.is_in() { 7 } else { 3 });
+                    }
+                }
+
+                // [0..255] --> [0..7]
+                fn interval_map(v: u8) -> u8 {
+                    if v == 0 {
+                        0
+                    } else {
+                        7 - v.leading_zeros() as u8
+                    }
+                }
+                let interval = match self.speed {
+                    PortSpeed::Full | PortSpeed::Low => {
+                        if config.ep_type == EndpointType::Isochronous {
+                            config.interval + 2
+                        } else {
+                            interval_map(config.interval) + 3
+                        }
+                    }
+                    _ => config.interval - 1,
+                };
+                ep_ctx.set_interval(interval);
+
+                ep_ctx.set_max_packet_size(config.max_packet_size);
+                ep_ctx.set_average_trb_length(1);
+                ep_ctx.set_transfer_ring_buffer(tr_buf_ptr as usize);
+                ep_ctx.set_dequeue_cycle_state(1);
+                ep_ctx.set_max_primary_streams(0);
+                ep_ctx.set_mult(0);
+                ep_ctx.set_error_count(3);
+            }
+
+            Ok(&self.input_ctx as *const InputContext)
+        }
+
+        fn on_endpoints_configured(&mut self) -> Result<()> {
+            for idx in 0..self.class_drivers.len() {
+                let class_driver = self.class_drivers.get_mut(idx).expect("index out of range");
+                match class_driver.on_endpoints_configured()? {
+                    class_driver::TransferRequest::NoOp => continue,
+                    class_driver::TransferRequest::ControlOut(setup_data) => {
+                        self.control_out(
+                            EndpointId::DEFAULT_CONTROL_PIPE,
+                            setup_data,
+                            Some(idx),
+                            None,
+                            0,
+                        )?;
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+            Ok(())
+        }
+
+        fn on_command_completion_event_received(&mut self, issuer_type: u8) -> Result<()> {
+            match issuer_type {
+                trb::AddressDeviceCommand::TYPE => {
+                    self.init_phase = 0;
+                    self.get_descriptor(
+                        EndpointId::DEFAULT_CONTROL_PIPE,
+                        DeviceDescriptor::TYPE,
+                        0,
+                        8, // request first 8-bytes
+                    )
+                }
+                trb::EvaluateContextCommand::TYPE => {
+                    self.init_phase = 1;
+                    self.get_descriptor(
+                        EndpointId::DEFAULT_CONTROL_PIPE,
+                        DeviceDescriptor::TYPE,
+                        0,
+                        18, // entire descriptor
+                    )
+                }
+                _ => {
+                    unreachable!();
+                }
+            }
+        }
+
+        fn on_transfer_event_received(&mut self, trb: &trb::TransferEvent) -> Result<()> {
+            if !(trb.completion_code() == 1 /* Success */ || trb.completion_code() == 13/* Short Packet*/)
+            {
+                warn!(
+                    "on_transfer_event_received: invalid trb = {:?} (completion code: {})",
+                    trb.upcast(),
+                    trb.completion_code(),
+                );
+                return Err(Error::TransferFailed {
+                    slot_id: trb.slot_id(),
+                });
+            }
+
+            trace!(
+                "device::on_transfer_event_received: issuer TRB = {:p}",
+                trb.trb_pointer()
+            );
+
             let issuer_trb = unsafe { &*trb.trb_pointer() };
+            let residual_bytes = trb.trb_transfer_length() as usize;
+
             if let Some(normal) = issuer_trb.downcast_ref::<trb::Normal>() {
-                unimplemented!();
+                let transfer_length = normal.trb_transfer_length() as usize - residual_bytes;
+                return self.on_interrupt_completed(
+                    EndpointId {
+                        addr: trb.endpoint_id(),
+                    },
+                    NonNull::new(normal.data_buffer()).expect("data buffer null"),
+                    transfer_length,
+                );
             }
 
             let setup_data = match self
@@ -1858,24 +2328,23 @@ pub mod xhci {
                 }
             };
 
-            let transfered_size;
-
-            if let Some(data_stage) = issuer_trb.downcast_ref::<trb::DataStage>() {
-                let residual_bytes = trb.trb_transfer_length() as usize;
-                debug!("residual_bytes = {}", residual_bytes);
-                transfered_size = data_stage.trb_transfer_length() as usize - residual_bytes;
-            } else if let Some(status_stage) = issuer_trb.downcast_ref::<trb::StatusStage>() {
-                // TODO: update max packet size
-                transfered_size = 0;
-            } else {
-                unimplemented!();
-            }
+            let (buf, transfered_size) =
+                if let Some(data_stage) = issuer_trb.downcast_ref::<trb::DataStage>() {
+                    let buf = NonNull::new(data_stage.data_buffer()).expect("null pointer");
+                    trace!("residual_bytes = {}", residual_bytes);
+                    (Some(buf), setup_data.length as usize - residual_bytes)
+                } else if let Some(status_stage) = issuer_trb.downcast_ref::<trb::StatusStage>() {
+                    (None, 0)
+                } else {
+                    unimplemented!();
+                };
 
             self.on_control_completed(
                 EndpointId {
                     addr: trb.endpoint_id(),
                 },
                 setup_data,
+                buf,
                 transfered_size,
             )
         }
@@ -1884,6 +2353,7 @@ pub mod xhci {
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
+            buf: Option<NonNull<u8>>,
             transfered_size: usize,
         ) -> Result<()> {
             debug!(
@@ -1891,29 +2361,24 @@ pub mod xhci {
                 transfered_size,
                 setup_data.direction(),
             );
-
-            if self.is_initialized {
-                match self.event_waiters.get_mut(&setup_data) {
-                    Some(w) => {
-                        return unsafe {
-                            (**w).on_control_completed(
-                                ep_id,
-                                setup_data,
-                                &self.buf[..transfered_size],
-                            )
-                        };
-                    }
-                    None => {
-                        return Err(Error::NoWaiter);
+            match self.init_phase {
+                0 => {
+                    unsafe { self.attach_buf(buf.unwrap()) };
+                    let buf = Self::slice(&mut self.buf, ..transfered_size);
+                    if setup_data.request == Request::GetDescriptor as u8
+                        && descriptor::from_bytes::<DeviceDescriptor>(buf).is_some()
+                    {
+                        self.initialize_phase0(transfered_size)
+                    } else {
+                        warn!("failed to go initialize_phase0");
+                        Err(Error::InvalidPhase)
                     }
                 }
-            }
-
-            let bytes = &self.buf[..transfered_size];
-            match self.init_phase {
                 1 => {
+                    unsafe { self.attach_buf(buf.unwrap()) };
+                    let buf = Self::slice(&mut self.buf, ..transfered_size);
                     if setup_data.request == Request::GetDescriptor as u8
-                        && descriptor::from_bytes::<DeviceDescriptor>(bytes).is_some()
+                        && descriptor::from_bytes::<DeviceDescriptor>(buf).is_some()
                     {
                         self.initialize_phase1(transfered_size)
                     } else {
@@ -1922,8 +2387,10 @@ pub mod xhci {
                     }
                 }
                 2 => {
+                    unsafe { self.attach_buf(buf.unwrap()) };
+                    let buf = Self::slice(&mut self.buf, ..transfered_size);
                     if setup_data.request == Request::GetDescriptor as u8
-                        && descriptor::from_bytes::<ConfigurationDescriptor>(bytes).is_some()
+                        && descriptor::from_bytes::<ConfigurationDescriptor>(buf).is_some()
                     {
                         self.initialize_phase2(transfered_size)
                     } else {
@@ -1932,22 +2399,70 @@ pub mod xhci {
                     }
                 }
                 3 => {
-                    unimplemented!();
+                    if setup_data.request == Request::SetConfiguration as u8 {
+                        debug_assert!(buf.is_none() && self.buf.is_some());
+                        self.initialize_phase3((setup_data.value & 0xFF) as u8)
+                    } else {
+                        warn!("failed to go initialize_phase3");
+                        Err(Error::InvalidPhase)
+                    }
                 }
-                _ => unimplemented!(),
+                _ => match self.event_waiters.get(&setup_data) {
+                    Some(&w_idx) => {
+                        let w = self
+                            .class_drivers
+                            .get_mut(w_idx)
+                            .expect("uninitialized class driver");
+                        match w.on_control_completed(ep_id, setup_data, buf, transfered_size)? {
+                            class_driver::TransferRequest::InterruptIn { ep_id, buf, size } => {
+                                self.interrupt_in(ep_id, buf, size)
+                            }
+                            _ => unimplemented!(),
+                        }
+                    }
+                    None => Err(Error::NoWaiter),
+                },
             }
+        }
+
+        fn on_interrupt_completed(
+            &mut self,
+            ep_id: EndpointId,
+            buf: NonNull<u8>,
+            transfered_size: usize,
+        ) -> Result<()> {
+            trace!(
+                "Device::on_interrupt_completed: EP addr = {}",
+                ep_id.address()
+            );
+            if let Some(driver_idx) = self.class_driver_idxs[ep_id.number() as usize] {
+                let w = self.class_drivers.get_mut(driver_idx).unwrap();
+                match w.on_interrupt_completed(ep_id, buf, transfered_size)? {
+                    class_driver::TransferRequest::InterruptIn { ep_id, buf, size } => {
+                        self.interrupt_in(ep_id, buf, size)?;
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+            Ok(())
+        }
+
+        fn ring_doorbell(&mut self, dci: DeviceContextIndex) {
+            trace!("ring the doorbell with target {}", dci.0);
+            unsafe { (*self.doorbell).ring(dci.0 as u8) };
         }
 
         fn control_in(
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            issuer: Option<&mut (dyn super::class_driver::Driver + 'static)>,
-            use_buf: bool,
+            issuer_idx: Option<usize>,
+            buf: Option<NonNull<u8>>,
+            size: usize,
         ) -> Result<()> {
-            if let Some(issuer) = issuer {
+            if let Some(issuer_idx) = issuer_idx {
                 self.event_waiters
-                    .insert(setup_data.clone(), issuer)
+                    .insert(setup_data.clone(), issuer_idx)
                     .map_err(|e| match e {
                         ArrayMapError::NoSpace => Error::TooManyWaiters,
                         ArrayMapError::SameKeyRegistered => {
@@ -1966,24 +2481,25 @@ pub mod xhci {
                 .as_mut()
                 .ok_or(Error::TransferRingNotSet)?;
 
-            if use_buf {
-                // TODO: update max packet size
-
+            if let Some(buf) = buf {
                 let setup_stage = trb::SetupStage::new_in_data_stage(setup_data);
-                let setup_trb_ptr = tr.push(&setup_stage);
-                let setup_trb_ptr = setup_trb_ptr.downcast_ref::<trb::SetupStage>().unwrap()
-                    as *const trb::SetupStage;
+                let setup_stage_trb_ptr = tr.push(setup_stage.upcast());
+                let setup_stage_trb_ptr = setup_stage_trb_ptr
+                    .downcast_ref::<trb::SetupStage>()
+                    .unwrap() as *const trb::SetupStage;
 
-                let mut data = trb::DataStage::new_in(&self.buf[..]);
-                data.set_interrupt_on_completion(1);
-                let data_trb_ptr = tr.push(&data) as *const trb::GenericTrb;
+                let mut data_stage = trb::DataStage::new_in(buf.as_ptr(), size);
+                data_stage.set_interrupt_on_completion(1);
+                let data_stage_trb_ptr = tr.push(data_stage.upcast()) as *const trb::GenericTrb;
 
-                let status = trb::StatusStage::default();
-                let status_stage_trb = tr.push(&status);
-                debug!("status_stage_trb = {:p}", status_stage_trb);
+                let mut status_stage = trb::StatusStage::default();
+                status_stage.set_direction(0);
+
+                let status_stage_trb_ptr = tr.push(status_stage.upcast());
+                debug!("status_stage_trb = {:p}", status_stage_trb_ptr);
 
                 self.setup_stage_map
-                    .insert(data_trb_ptr, setup_trb_ptr)
+                    .insert(data_stage_trb_ptr, setup_stage_trb_ptr)
                     .map_err(|e| match e {
                         ArrayMapError::NoSpace => Error::TooManyWaiters,
                         ArrayMapError::SameKeyRegistered => {
@@ -1991,7 +2507,7 @@ pub mod xhci {
                         }
                     })?;
 
-                unsafe { (*self.doorbell).ring(dci.0 as u8, 0) };
+                self.ring_doorbell(dci);
             } else {
                 unimplemented!();
             }
@@ -2003,10 +2519,81 @@ pub mod xhci {
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            issuer: Option<&mut dyn super::class_driver::Driver>,
-            use_buf: bool,
+            issuer_idx: Option<usize>,
+            buf: Option<NonNull<u8>>,
+            size: usize,
         ) -> Result<()> {
-            unimplemented!();
+            if let Some(issuer_idx) = issuer_idx {
+                self.event_waiters
+                    .insert(setup_data.clone(), issuer_idx)
+                    .map_err(|e| match e {
+                        ArrayMapError::NoSpace => Error::TooManyWaiters,
+                        ArrayMapError::SameKeyRegistered => {
+                            panic!("same setup_data registered")
+                        }
+                    })?;
+            }
+
+            debug!("device::control_out: ep addr = {}", ep_id.address());
+            if 15 < ep_id.number() {
+                return Err(Error::InvalidEndpointNumber);
+            }
+
+            let dci = DeviceContextIndex::from(ep_id);
+            let tr = self.transfer_rings[dci.0 - 1]
+                .as_mut()
+                .ok_or(Error::TransferRingNotSet)?;
+
+            if let Some(buf) = buf {
+                unimplemented!();
+            } else {
+                let setup_stage = trb::SetupStage::new_no_data_stage(setup_data);
+                let setup_stage_trb_ptr = tr.push(setup_stage.upcast());
+                let setup_stage_trb_ptr = setup_stage_trb_ptr
+                    .downcast_ref::<trb::SetupStage>()
+                    .unwrap() as *const trb::SetupStage;
+
+                let mut status_stage = trb::StatusStage::default();
+                status_stage.set_direction(1);
+                status_stage.set_interrupt_on_completion(1);
+                let status_stage_trb_ptr = tr.push(status_stage.upcast());
+                debug!("status_stage_trb = {:p}", status_stage_trb_ptr);
+
+                self.setup_stage_map
+                    .insert(status_stage_trb_ptr, setup_stage_trb_ptr)
+                    .map_err(|e| match e {
+                        ArrayMapError::NoSpace => Error::TooManyWaiters,
+                        ArrayMapError::SameKeyRegistered => {
+                            panic!("same data_stage_trb_ptr registered")
+                        }
+                    })?;
+
+                self.ring_doorbell(dci);
+            }
+            Ok(())
+        }
+
+        fn interrupt_in(
+            &mut self,
+            ep_id: EndpointId,
+            buf: Option<NonNull<u8>>,
+            size: usize,
+        ) -> Result<()> {
+            let dci = DeviceContextIndex::from(ep_id);
+            let tr = self.transfer_rings[dci.0 - 1]
+                .as_mut()
+                .ok_or(Error::TransferRingNotSet)?;
+
+            let mut normal = trb::Normal::default();
+            normal.set_data_buffer(buf.map(|ptr| ptr.as_ptr()).unwrap_or(null_mut()));
+            normal.set_trb_transfer_length(size as u32);
+            normal.set_interrupt_on_short_packet(1);
+            normal.set_interrupt_on_completion(1);
+
+            tr.push(normal.upcast());
+            self.ring_doorbell(dci);
+
+            Ok(())
         }
 
         fn get_descriptor(
@@ -2014,57 +2601,82 @@ pub mod xhci {
             ep_id: EndpointId,
             desc_type: u8,
             desc_index: u8,
+            transfer_size: usize,
         ) -> Result<()> {
             let mut setup_data = SetupData::default();
-            setup_data.set_direction(request_type::Direcrion::DeviceToHost as u8);
+            setup_data.set_direction(request_type::Direction::DeviceToHost as u8);
             setup_data.set_typ(request_type::Type::Standard as u8);
             setup_data.set_recipient(request_type::Recipient::Device as u8);
             setup_data.request = Request::GetDescriptor as u8;
             setup_data.value = ((desc_type as u16) << 8) | (desc_index as u16);
             setup_data.index = 0;
-            setup_data.length = self.buf.len() as u16;
 
-            self.control_in(ep_id, setup_data, None, true)
+            let buf = self.detach_buf();
+            setup_data.length = transfer_size as u16;
+            self.control_in(ep_id, setup_data, None, Some(buf), transfer_size)
         }
 
         fn set_configuration(&mut self, ep_id: EndpointId, config_value: u8) -> Result<()> {
-            unimplemented!()
+            let mut setup_data = SetupData::default();
+            setup_data.set_direction(request_type::Direction::HostToDevice as u8);
+            setup_data.set_typ(request_type::Type::Standard as u8);
+            setup_data.set_recipient(request_type::Recipient::Device as u8);
+            setup_data.request = Request::SetConfiguration as u8;
+            setup_data.value = config_value as u16;
+            setup_data.index = 0;
+            setup_data.length = 0;
+            self.control_out(ep_id, setup_data, None, None, 0)
         }
     }
 
     struct DeviceManager {
-        devices: &'static mut [*mut Device],
+        devices: &'static mut [Option<&'static mut Device>],
         device_context_pointers: *mut [*const DeviceContext],
         doorbells: *mut DoorbellRegister, // 1-255
     }
     impl DeviceManager {
-        pub fn new(max_slots: usize, doorbells: *mut DoorbellRegister) -> Result<Self> {
+        pub fn new(
+            max_slots: usize,
+            doorbells: *mut DoorbellRegister,
+            scratchpad_buf_arr: *const *const u8,
+        ) -> Result<Self> {
             let mut malloc = MALLOC.lock();
 
-            let devices = malloc
-                .alloc_slice::<*mut Device>(max_slots + 1)
-                .ok_or(Error::NoEnoughMemory)?;
-            let devices: &mut [MaybeUninit<*mut Device>] = unsafe { &mut *devices.as_ptr() };
+            let devices: &mut [MaybeUninit<Option<&'static mut Device>>] = unsafe {
+                malloc
+                    .alloc_slice::<Option<&'static mut Device>>(max_slots + 1)
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
+            };
             for p in devices.iter_mut() {
-                *p = MaybeUninit::new(null_mut());
+                *p = MaybeUninit::new(None);
             }
             let devices = unsafe {
-                core::mem::transmute::<&mut [MaybeUninit<*mut Device>], &mut [*mut Device]>(devices)
+                core::mem::transmute::<
+                    &mut [MaybeUninit<Option<&'static mut Device>>],
+                    &mut [Option<&'static mut Device>],
+                >(devices)
             };
 
             // NOTE: DCBAA: alignment = 64-bytes, boundary = PAGESIZE
-            let bound = malloc.default_boundary;
-            let dcbaap = malloc
-                .alloc_slice_ext::<*const DeviceContext>(max_slots + 1, 64, bound)
-                .ok_or(Error::NoEnoughMemory)?;
-            {
-                let dcbaap: &mut [MaybeUninit<*const DeviceContext>] =
-                    unsafe { &mut *dcbaap.as_ptr() };
-                for p in dcbaap.iter_mut() {
-                    *p = MaybeUninit::new(null());
-                }
+            let dcbaap: &mut [MaybeUninit<*const DeviceContext>] = unsafe {
+                malloc
+                    .alloc_slice_ext::<*const DeviceContext>(max_slots + 1, 64, None)
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
+            };
+            for p in dcbaap.iter_mut() {
+                *p = MaybeUninit::new(null());
             }
-            let dcbaap = dcbaap.as_ptr() as *mut [*const DeviceContext];
+            dcbaap[0] = MaybeUninit::new(scratchpad_buf_arr as *const _);
+
+            let dcbaap = unsafe {
+                core::mem::transmute::<
+                    &mut [MaybeUninit<*const DeviceContext>],
+                    &mut [*const DeviceContext],
+                >(dcbaap)
+            };
+            let dcbaap = dcbaap as *mut [*const DeviceContext];
 
             debug!(
                 "DeviceManager has been initialized for up to {} devices",
@@ -2083,29 +2695,44 @@ pub mod xhci {
             if !(1 <= slot_id && slot_id < self.devices.len()) {
                 return Err(Error::InvalidSlotId);
             }
-            if !self.devices[slot_id].is_null() {
+            if self.devices[slot_id].is_some() {
                 return Err(Error::DeviceAlreadyAllocated);
             }
 
-            let device_ctx = MALLOC
-                .lock()
-                .alloc_obj::<DeviceContext>()
-                .ok_or(Error::NoEnoughMemory)?;
-            let device_ctx = device_ctx.as_ptr();
-            unsafe { DeviceContext::initialize_ptr((*device_ctx).as_mut_ptr()) };
-            let device_ctx = device_ctx as *const DeviceContext;
+            let device_ctx: &mut MaybeUninit<DeviceContext> = unsafe {
+                MALLOC
+                    .lock()
+                    .alloc_obj::<DeviceContext>()
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
+            };
+            unsafe { DeviceContext::initialize_ptr(device_ctx.as_mut_ptr()) };
+            let device_ctx =
+                device_ctx as *const MaybeUninit<DeviceContext> as *const DeviceContext;
 
-            let device = MALLOC
-                .lock()
-                .alloc_obj::<Device>()
-                .ok_or(Error::NoEnoughMemory)?;
-            let device = unsafe { (*device.as_ptr()).as_mut_ptr() };
-
-            let input_ctx = unsafe {
-                Device::initialize_ptr(device, device_ctx, self.doorbells.add(slot_id - 1), port)?
+            let device: &mut MaybeUninit<Device> = unsafe {
+                MALLOC
+                    .lock()
+                    .alloc_obj::<Device>()
+                    .ok_or(Error::NoEnoughMemory)?
+                    .as_mut()
             };
 
-            self.devices[slot_id] = device;
+            let input_ctx = unsafe {
+                Device::initialize_ptr(
+                    device.as_mut_ptr() as *mut Device,
+                    device_ctx,
+                    self.doorbells.add(slot_id - 1),
+                    slot_id as u8,
+                    port,
+                )?
+            };
+
+            let device =
+                unsafe { core::mem::transmute::<&mut MaybeUninit<Device>, &mut Device>(device) };
+
+            self.devices[slot_id] = Some(device);
+
             unsafe {
                 (*self.device_context_pointers)
                     .as_mut_ptr()
@@ -2119,49 +2746,43 @@ pub mod xhci {
 
         pub fn dcbaap(&self) -> *const *const DeviceContext {
             let ptr = unsafe { (*self.device_context_pointers).as_ptr() };
-            assert!((ptr as usize) % 64 == 0);
+            debug_assert!((ptr as usize) % 64 == 0);
             ptr
         }
 
         pub fn find_by_slot(&self, slot_id: u8) -> Option<&Device> {
-            self.devices.get(slot_id as usize).copied().and_then(|p| {
-                if p.is_null() {
-                    None
-                } else {
-                    Some(unsafe { &*p })
-                }
-            })
+            self.devices
+                .get(slot_id as usize)
+                .and_then(|dev| dev.as_deref())
         }
 
         pub fn find_by_slot_mut(&mut self, slot_id: u8) -> Option<&mut Device> {
             self.devices
                 .get_mut(slot_id as usize)
-                .copied()
-                .and_then(|p| {
-                    if p.is_null() {
-                        None
-                    } else {
-                        Some(unsafe { &mut *p })
-                    }
-                })
+                .and_then(|dev| dev.as_deref_mut())
         }
     }
     // TODO: impl Drop for DeviceManager
 
+    #[derive(Debug)]
     #[repr(u8)]
     pub enum PortSpeed {
         Full = 1,
         Low = 2,
         High = 3,
         Super = 4,
-        SuperPlus = 5,
+        SuperSpeedPlus = 5,
     }
     impl PortSpeed {
         pub fn determine_max_packet_size_for_control_pipe(&self) -> u16 {
             match self {
-                Self::Super => 512,
+                Self::SuperSpeedPlus | Self::Super => 512,
                 Self::High => 64,
-                _ => 8,
+                Self::Full => {
+                    warn!("Max Packet Size of FullSpeed devices is one of 8, 16, 32, or 64");
+                    8
+                }
+                Self::Low => 8,
             }
         }
     }
@@ -2172,8 +2793,8 @@ pub mod xhci {
                 2 => Self::Low,
                 3 => Self::High,
                 4 => Self::Super,
-                5 => Self::SuperPlus,
-                _ => panic!("invalid speed: {}", speed),
+                5 => Self::SuperSpeedPlus,
+                _ => panic!("unknown speed: {}", speed),
             }
         }
     }
@@ -2214,30 +2835,32 @@ pub mod xhci {
         pub fn reset(&mut self) {
             unsafe {
                 (*self.regs).portsc.modify_with(|portsc| {
-                    portsc.data &= 0x0E00C3E0;
-                    portsc.data |= 0x00020010; // Write 1 to PR and CSC
+                    portsc.data &= 0b_0000_1110_1111_1110_1100_0011_1110_0000;
+                    portsc.data |= 0b_0000_0000_0000_0010_0000_0000_0001_0000; // Write 1 to PR and CSC
                 })
             };
             while unsafe { (*self.regs).portsc.read().port_reset() == 1 } {}
-            debug!("reset done on port {}", self.port_num);
+            trace!("port reset on port {}", self.port_num);
         }
 
         pub fn clear_connect_status_change(&mut self) {
             unsafe {
                 (*self.regs).portsc.modify_with(|portsc| {
-                    portsc.data &= 0x0E01C3E0;
+                    portsc.data &= 0b_0000_1110_1111_1110_1100_0011_1110_0000;
                     portsc.set_connect_status_change(1);
                 })
             };
+            trace!("clear CCS on port {}", self.port_num);
         }
 
         pub fn clear_port_reset_change(&mut self) {
             unsafe {
                 (*self.regs).portsc.modify_with(|portsc| {
-                    portsc.data &= 0x0E01C3E0;
+                    portsc.data &= 0b_0000_1110_1111_1110_1100_0011_1110_0000;
                     portsc.set_port_reset_change(1);
                 })
             };
+            trace!("clear PRC on port {}", self.port_num);
         }
 
         pub fn number(&self) -> u8 {
@@ -2263,13 +2886,11 @@ pub mod xhci {
         pub fn speed(&self) -> PortSpeed {
             unsafe { (*self.regs).portsc.read().port_speed() }.into()
         }
-    }
 
-    use crate::sync::spin::SpinMutex;
-    use crate::utils::StaticMallocator;
-    const BUF_SIZE: usize = 4096 * 32;
-    static MALLOC: SpinMutex<StaticMallocator<BUF_SIZE>> =
-        SpinMutex::new("usb/malloc", StaticMallocator::new());
+        pub fn bits(&self) -> u32 {
+            unsafe { (*self.regs).portsc.read().data }
+        }
+    }
 }
 
 mod request_type {
@@ -2287,15 +2908,21 @@ mod request_type {
         Vendor = 2,
     }
     #[repr(u8)]
-    pub enum Direcrion {
+    pub enum Direction {
         HostToDevice = 0,
         DeviceToHost = 1,
     }
 }
 
-#[repr(C)]
+#[repr(u8)]
 enum Request {
     GetDescriptor = 6,
+    SetConfiguration = 9,
+}
+#[repr(u8)]
+enum HidRequest {
+    GetReport = 1,
+    SetProtocol = 11,
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -2318,6 +2945,7 @@ impl SetupData {
     setter!(request_type: u8; 0b10000000; u8, pub set_direction);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EndpointType {
     Control = 0,
@@ -2325,8 +2953,20 @@ pub enum EndpointType {
     Bulk = 2,
     Interrupt = 3,
 }
+impl core::convert::TryFrom<u8> for EndpointType {
+    type Error = Error;
+    fn try_from(ty: u8) -> core::result::Result<Self, Self::Error> {
+        match ty {
+            0 => Ok(Self::Control),
+            1 => Ok(Self::Isochronous),
+            2 => Ok(Self::Bulk),
+            3 => Ok(Self::Interrupt),
+            _ => Err(Error::InvalidEndpointType { ty }),
+        }
+    }
+}
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct EndpointId {
     addr: u8,
 }
@@ -2362,11 +3002,25 @@ impl EndpointId {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct EndpointConfig {
     ep_id: EndpointId,
     ep_type: EndpointType,
-    max_packet_size: usize,
-    interval: usize,
+    max_packet_size: u16,
+    interval: u8,
+}
+impl From<&descriptor::EndpointDescriptor> for EndpointConfig {
+    fn from(ep_desc: &descriptor::EndpointDescriptor) -> Self {
+        Self {
+            ep_id: EndpointId::new_in(ep_desc.number()),
+            ep_type: <EndpointType as core::convert::TryFrom<u8>>::try_from(
+                ep_desc.transfer_type(),
+            )
+            .expect("invalid EndpointType"),
+            max_packet_size: ep_desc.max_packet_size,
+            interval: ep_desc.interval,
+        }
+    }
 }
 
 mod descriptor {
@@ -2375,6 +3029,8 @@ mod descriptor {
         Device = 1,
         Configuration = 2,
         Interface = 4,
+        Endpoint = 5,
+        Hid = 33,
     }
 
     pub trait Descriptor {
@@ -2382,7 +3038,7 @@ mod descriptor {
     }
 
     pub fn from_bytes<D: Descriptor>(bytes: &[u8]) -> Option<&D> {
-        if bytes[0] == core::mem::size_of::<D>() as u8 && bytes[1] == D::TYPE {
+        if !bytes.is_empty() && bytes[0] == core::mem::size_of::<D>() as u8 && bytes[1] == D::TYPE {
             let p = bytes.as_ptr() as *const D;
             Some(unsafe { &*p })
         } else {
@@ -2409,6 +3065,30 @@ mod descriptor {
     }
     impl Descriptor for DeviceDescriptor {
         const TYPE: u8 = Type::Device as u8;
+    }
+
+    pub struct DescIter<'buf> {
+        buf: &'buf [u8],
+    }
+    impl<'buf> DescIter<'buf> {
+        pub fn new(conf_desc: &'buf [u8]) -> Self {
+            Self { buf: conf_desc }
+        }
+        pub fn next<D: Descriptor>(&mut self) -> Option<&'buf D> {
+            loop {
+                let sz = self.buf[0] as usize;
+                if self.buf.len() < sz {
+                    return None;
+                }
+                self.buf = &self.buf[sz..];
+                if self.buf.is_empty() {
+                    return None;
+                }
+                if let Some(desc) = from_bytes(self.buf) {
+                    return Some(desc);
+                }
+            }
+        }
     }
 
     #[repr(C, packed)]
@@ -2441,62 +3121,362 @@ mod descriptor {
     impl Descriptor for InterfaceDescriptor {
         const TYPE: u8 = Type::Interface as u8;
     }
+
+    #[repr(C, packed)]
+    pub struct EndpointDescriptor {
+        pub length: u8,
+        pub descriptor_type: u8,
+        pub endpoint_address: u8,
+        pub attributes: u8,
+        pub max_packet_size: u16,
+        pub interval: u8,
+    }
+    impl EndpointDescriptor {
+        getter!(endpoint_address: u8; 0b00001111; u8, pub number);
+        getter!(endpoint_address: u8; 0b10000000; u8, pub dir_in);
+        getter!(attributes: u8; 0b00000011; u8, pub transfer_type);
+        getter!(attributes: u8; 0b00001100; u8, pub sync_type);
+        getter!(attributes: u8; 0b00110000; u8, pub usage_type);
+    }
+    impl Descriptor for EndpointDescriptor {
+        const TYPE: u8 = Type::Endpoint as u8;
+    }
+
+    #[repr(C, packed)]
+    pub struct HidDescriptor {
+        pub length: u8,
+        pub descriptor_type: u8,
+        pub hid_release: u16,
+        pub country_code: u8,
+        pub num_descriptors: u8,
+    }
+    impl Descriptor for HidDescriptor {
+        const TYPE: u8 = Type::Hid as u8;
+    }
+    impl core::fmt::Debug for HidDescriptor {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let HidDescriptor {
+                length,
+                descriptor_type,
+                hid_release: _,
+                country_code,
+                num_descriptors,
+            } = self.clone();
+            let hid_release = self.hid_release;
+            write!(f, "HidDescriptor {{ length: {}, descriptor_type: {}, hid_release: {}, country_code: {}, num_descriptors: {} }}", length, descriptor_type, hid_release, country_code, num_descriptors)
+        }
+    }
 }
 
 pub mod class_driver {
-    use super::Result;
-    use super::{EndpointConfig, EndpointId, SetupData};
+    use super::MALLOC;
+    use super::{request_type, EndpointConfig, EndpointId, EndpointType, HidRequest, SetupData};
+    use super::{Error, Result};
+
+    use core::ptr::NonNull;
+
+    pub enum TransferRequest {
+        NoOp,
+        ControlOut(SetupData),
+        InterruptIn {
+            ep_id: EndpointId,
+            buf: Option<NonNull<u8>>,
+            size: usize,
+        },
+        InterruptOut {
+            ep_id: EndpointId,
+            buf: Option<NonNull<u8>>,
+            size: usize,
+        },
+    }
 
     pub trait Driver {
-        fn initialize(&mut self) -> Result<()>;
         fn set_endpoint(&mut self, config: &EndpointConfig) -> Result<()>;
+        fn on_endpoints_configured(&mut self) -> Result<TransferRequest>;
         fn on_control_completed(
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            buf: &[u8],
-        ) -> Result<()>;
-        fn on_interrupt_completed(&mut self, ep_id: EndpointId, buf: &[u8]) -> Result<()>;
+            buf: Option<NonNull<u8>>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest>;
+        fn on_interrupt_completed(
+            &mut self,
+            ep_id: EndpointId,
+            buf: NonNull<u8>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest>;
     }
 
-    pub trait HidDriver: Driver {}
-
-    pub struct HidMouseDriver {
-        device: *mut super::xhci::Device,
+    pub struct HidDriver {
         interface_idx: u8,
         in_packet_size: usize,
+        ep_interrupt_in: Option<EndpointId>,
+        ep_interrupt_out: Option<EndpointId>,
+        init_phase: u8,
+        buf: Option<NonNull<[u8]>>,
+        prev_buf: Option<NonNull<[u8]>>,
+    }
+
+    impl HidDriver {
+        fn detach_buf(&mut self) -> NonNull<u8> {
+            let ptr = self.buf.take().expect("ownership error");
+            unsafe { NonNull::new_unchecked((*ptr.as_ptr()).as_mut_ptr()) }
+        }
+
+        /// Safety: `buf_ptr` must be a pointer which is derived from `detach_buf`.
+        unsafe fn attach_buf(&mut self, buf_ptr: NonNull<u8>) {
+            debug_assert!(self.buf.is_none());
+            let buf = NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+                buf_ptr.as_ptr(),
+                Self::BUF_SIZE,
+            ));
+            self.buf = Some(buf);
+        }
+
+        fn slice<'a, R>(buf: &'a mut Option<NonNull<[u8]>>, range: R) -> &'a mut [u8]
+        where
+            R: core::ops::RangeBounds<usize> + core::slice::SliceIndex<[u8], Output = [u8]>,
+        {
+            unsafe { &mut buf.as_mut().expect("ownership error").as_mut()[range] }
+        }
+    }
+
+    impl HidDriver {
+        const BUF_SIZE: usize = 1024;
+
+        pub fn new(interface_idx: u8, in_packet_size: usize) -> Result<Self> {
+            let mut malloc = MALLOC.lock();
+
+            let buf = malloc
+                .alloc(Self::BUF_SIZE, 64, None)
+                .ok_or(Error::NoEnoughMemory)?;
+
+            let prev_buf = malloc
+                .alloc(Self::BUF_SIZE, 64, None)
+                .ok_or(Error::NoEnoughMemory)?;
+
+            Ok(Self {
+                interface_idx,
+                in_packet_size,
+                ep_interrupt_in: None,
+                ep_interrupt_out: None,
+                buf: Some(buf),
+                prev_buf: Some(prev_buf),
+                init_phase: 0,
+            })
+        }
+
+        fn swap_buffer(&mut self) {
+            let buf = &mut self.buf;
+            let prev_buf = &mut self.prev_buf;
+            core::mem::swap(buf, prev_buf);
+        }
+
+        pub fn buffer(&mut self) -> &mut [u8] {
+            Self::slice(&mut self.prev_buf, ..)
+        }
+    }
+    impl Driver for HidDriver {
+        fn set_endpoint(&mut self, config: &EndpointConfig) -> Result<()> {
+            if config.ep_type == EndpointType::Interrupt {
+                if config.ep_id.is_in() {
+                    self.ep_interrupt_in = Some(config.ep_id);
+                } else {
+                    self.ep_interrupt_out = Some(config.ep_id);
+                }
+            }
+            Ok(())
+        }
+
+        fn on_control_completed(
+            &mut self,
+            ep_id: EndpointId,
+            setup_data: SetupData,
+            buf: Option<NonNull<u8>>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest> {
+            debug!(
+                "HidDriver::on_control_completed: phase = {}, transfered_size = {}",
+                self.init_phase, transfered_size
+            );
+
+            match self.init_phase {
+                1 => {
+                    debug_assert!(buf.is_none());
+                    self.init_phase = 2;
+                    let buf = self.detach_buf();
+                    Ok(TransferRequest::InterruptIn {
+                        ep_id: self.ep_interrupt_in.expect("Endpoint Not Initialized"),
+                        buf: Some(buf),
+                        size: self.in_packet_size,
+                    })
+                }
+                _ => unimplemented!(),
+            }
+        }
+
+        fn on_interrupt_completed(
+            &mut self,
+            ep_id: EndpointId,
+            buf: NonNull<u8>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest> {
+            if ep_id.is_in() {
+                unsafe { self.attach_buf(buf) };
+                self.swap_buffer();
+                Ok(TransferRequest::InterruptIn {
+                    ep_id: self.ep_interrupt_in.expect("Endpoint Not Initialized"),
+                    buf: Some(buf),
+                    size: self.in_packet_size,
+                })
+            } else {
+                unreachable!();
+            }
+        }
+
+        fn on_endpoints_configured(&mut self) -> Result<TransferRequest> {
+            let mut setup_data = SetupData::default();
+            setup_data.set_direction(request_type::Direction::HostToDevice as u8);
+            setup_data.set_typ(request_type::Type::Class as u8);
+            setup_data.set_recipient(request_type::Recipient::Interface as u8);
+            setup_data.request = HidRequest::SetProtocol as u8;
+            setup_data.value = 0; // boot protocol
+            setup_data.index = self.interface_idx as u16;
+            setup_data.length = 0;
+
+            self.init_phase = 1;
+            Ok(TransferRequest::ControlOut(setup_data))
+        }
+    }
+
+    use crate::sync::spin::SpinMutex;
+    static MOUSE_CURSOR_POS: SpinMutex<(isize, isize)> = SpinMutex::new("mouse_cursor", (0, 0));
+
+    pub struct HidMouseDriver {
+        hid_driver: HidDriver,
+    }
+    impl HidMouseDriver {
+        pub fn new(interface_idx: u8) -> Result<Self> {
+            Ok(Self {
+                hid_driver: HidDriver::new(interface_idx, 3)?,
+            })
+        }
     }
     impl Driver for HidMouseDriver {
-        fn initialize(&mut self) -> Result<()> {
-            unimplemented!()
-        }
         fn set_endpoint(&mut self, config: &EndpointConfig) -> Result<()> {
-            unimplemented!()
+            self.hid_driver.set_endpoint(config)
         }
         fn on_control_completed(
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            buf: &[u8],
-        ) -> Result<()> {
-            unimplemented!()
+            buf: Option<NonNull<u8>>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest> {
+            self.hid_driver
+                .on_control_completed(ep_id, setup_data, buf, transfered_size)
         }
-        fn on_interrupt_completed(&mut self, ep_id: EndpointId, buf: &[u8]) -> Result<()> {
-            unimplemented!()
+        fn on_interrupt_completed(
+            &mut self,
+            ep_id: EndpointId,
+            buf: NonNull<u8>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest> {
+            let req = self
+                .hid_driver
+                .on_interrupt_completed(ep_id, buf, transfered_size)?;
+
+            let first = self.hid_driver.buffer()[0];
+            let displacement_x = self.hid_driver.buffer()[1];
+            let displacement_y = self.hid_driver.buffer()[2];
+
+            let displacement_x = if displacement_x >= 128 {
+                (displacement_x as isize) - 256
+            } else {
+                displacement_x as isize
+            };
+            let displacement_y = if displacement_y >= 128 {
+                (displacement_y as isize) - 256
+            } else {
+                displacement_y as isize
+            };
+
+            info!(
+                "mouse moved: {}, dx: {:3}, dy: {:3}",
+                first, displacement_x, displacement_y
+            );
+
+            use crate::global::lock_frame_buffer;
+            use crate::graphics::{Color, Render};
+            let mut cursor = MOUSE_CURSOR_POS.lock();
+
+            let (mut x, mut y) = *cursor;
+            lock_frame_buffer(|frame_buffer| {
+                frame_buffer.draw_filled_rect(x, y, 32, 32, Color { r: 0, g: 0, b: 0 })
+            });
+
+            x += displacement_x;
+            y += displacement_y;
+
+            lock_frame_buffer(|frame_buffer| {
+                frame_buffer.draw_filled_rect(x, y, 32, 32, Color { r: 255, g: 0, b: 0 })
+            });
+            *cursor = (x, y);
+
+            Ok(req)
         }
-    }
-    impl HidDriver for HidMouseDriver {}
-    impl HidMouseDriver {
-        pub fn new(device: *mut super::xhci::Device, interface_idx: u8) -> Self {
-            Self {
-                device,
-                interface_idx,
-                in_packet_size: 3,
-            }
+        fn on_endpoints_configured(&mut self) -> Result<TransferRequest> {
+            self.hid_driver.on_endpoints_configured()
         }
     }
 
-    // pub struct HidKeyboardDriver {}
-    // impl Driver for HidKeyboardDriver {}
-    // impl HidDriver for HidKeyboardDriver {}
+    pub struct HidKeyboardDriver {
+        hid_driver: HidDriver,
+    }
+    impl HidKeyboardDriver {
+        pub fn new(interface_idx: u8) -> Result<Self> {
+            Ok(Self {
+                hid_driver: HidDriver::new(interface_idx, 8)?,
+            })
+        }
+    }
+    impl Driver for HidKeyboardDriver {
+        fn set_endpoint(&mut self, config: &EndpointConfig) -> Result<()> {
+            self.hid_driver.set_endpoint(config)
+        }
+        fn on_control_completed(
+            &mut self,
+            ep_id: EndpointId,
+            setup_data: SetupData,
+            buf: Option<NonNull<u8>>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest> {
+            self.hid_driver
+                .on_control_completed(ep_id, setup_data, buf, transfered_size)
+        }
+        fn on_interrupt_completed(
+            &mut self,
+            ep_id: EndpointId,
+            buf: NonNull<u8>,
+            transfered_size: usize,
+        ) -> Result<TransferRequest> {
+            let req = self
+                .hid_driver
+                .on_interrupt_completed(ep_id, buf, transfered_size)?;
+
+            for i in 2..8 {
+                let key = self.hid_driver.buffer()[i];
+                if key == 0 {
+                    continue;
+                }
+                debug!("key pushed = {}", key);
+            }
+
+            Ok(req)
+        }
+        fn on_endpoints_configured(&mut self) -> Result<TransferRequest> {
+            self.hid_driver.on_endpoints_configured()
+        }
+    }
 }
