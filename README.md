@@ -14,7 +14,15 @@ a hobby OS for x86_64 based on [MikanOS](https://github.com/uchan-nos/mikanos).
 
 ## Dependencies
 
+Crates:
+
 - [uefi-rs](https://github.com/rust-osdev/uefi-rs)
+
+Nightly features:
+
+- `asm`
+- `custom_test_frameworks`
+- `const_maybe_uninit_assume_init`
 
 ## Build image
 ```
