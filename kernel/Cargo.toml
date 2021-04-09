@@ -9,5 +9,11 @@ edition = "2018"
 [dependencies]
 
 [features]
-default = ["graphics"]
+default = ["graphics", "log_level_info"]
 graphics = []
+
+log_level_trace = ["log_level_debug"]
+log_level_debug = ["log_level_info"]
+log_level_info = ["log_level_warn"]
+log_level_warn = ["log_level_error"]
+log_level_error = []
