@@ -1,16 +1,18 @@
 use crate::console::{Attribute, Console};
-use crate::graphics::{font, FrameBuffer};
-use crate::sync::spin::SpinMutex;
+use crate::graphics::{font, FrameBuffer, Scaled};
 
-pub static FRAME_BUF: SpinMutex<core::mem::MaybeUninit<FrameBuffer>> =
-    SpinMutex::new("frame_buffer", core::mem::MaybeUninit::uninit());
+use crate::sync::spin::SpinMutex;
+use core::mem::MaybeUninit;
+
+pub static FRAME_BUF: SpinMutex<MaybeUninit<Scaled<FrameBuffer, 1>>> =
+    SpinMutex::new("frame_buffer", MaybeUninit::uninit());
 
 pub fn init_frame_buffer(frame_buffer: FrameBuffer) {
     let mut fb = FRAME_BUF.lock();
-    unsafe { fb.as_mut_ptr().write(frame_buffer) };
+    unsafe { fb.as_mut_ptr().write(Scaled(frame_buffer)) };
 }
 
-pub fn lock_frame_buffer<F: FnMut(&mut FrameBuffer)>(mut f: F) {
+pub fn lock_frame_buffer<F: FnMut(&mut Scaled<FrameBuffer, 1>)>(mut f: F) {
     let mut fb = FRAME_BUF.lock();
     let fb = unsafe { &mut *fb.as_mut_ptr() };
     f(fb)

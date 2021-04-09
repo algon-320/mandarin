@@ -102,6 +102,14 @@ impl Render for FrameBuffer {
     }
 }
 
+pub struct Scaled<R: Render, const SCALE: isize>(pub R);
+impl<R: Render, const SCALE: isize> Render for Scaled<R, SCALE> {
+    fn draw_pixel(&mut self, x: isize, y: isize, color: Color) {
+        self.0
+            .draw_filled_rect(x * SCALE, y * SCALE, SCALE, SCALE, color);
+    }
+}
+
 pub mod font {
     use super::{Color, Render};
 
