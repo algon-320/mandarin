@@ -31,16 +31,18 @@ pub mod xhci {
 
     use super::MALLOC;
     use super::{Error, Result};
-    use crate::utils::{ArrayMap, ArrayMapError, FixedVec};
+    use crate::utils::{ArrayMap, ArrayMapError, Buffer, FixedVec};
     use trb::Trb;
 
     #[repr(transparent)]
     struct MemMapped<T>(T);
     impl<T> MemMapped<T> {
         pub fn read(&self) -> T {
+            // Safety: the representation of `MemMapped<T>` is the same as that of `T`,
             unsafe { (self as *const Self as *const T).read_volatile() }
         }
         pub fn write(&mut self, val: T) {
+            // Safety: the representation of `MemMapped<T>` is the same as that of `T`,
             unsafe { (self as *const Self as *mut T).write_volatile(val) }
         }
         pub fn modify_with<F: FnOnce(&mut T)>(&mut self, f: F) {
@@ -57,8 +59,10 @@ pub mod xhci {
             data: u32,
         }
         impl Hcsparams1 {
+            // RO
             getter!(data: u32; 0x000000FF; u8, pub max_device_slots);
 
+            // RO
             getter!(data: u32; 0xFF000000; u8, pub max_ports);
         }
 
@@ -67,12 +71,14 @@ pub mod xhci {
             data: u32,
         }
         impl Hcsparams2 {
+            // RO
             getter!(data: u32; 0x03E00000; u8, max_scratchpad_bufs_hi);
             getter!(data: u32; 0xF8000000; u8, max_scratchpad_bufs_lo);
 
             pub fn max_scratchpad_buf(&self) -> usize {
-                ((self.max_scratchpad_bufs_hi() as usize) << 5)
-                    | (self.max_scratchpad_bufs_lo() as usize)
+                let lo = self.max_scratchpad_bufs_lo() as usize;
+                let hi = self.max_scratchpad_bufs_hi() as usize;
+                (hi << 5) | lo
             }
         }
 
@@ -86,6 +92,7 @@ pub mod xhci {
             data: u32,
         }
         impl Hccparams1 {
+            // RO
             getter!(data: u32; 0xFFFF0000; u16, pub xhci_extended_capabilities_pointer);
         }
 
@@ -160,25 +167,27 @@ pub mod xhci {
             data: u64,
         }
         impl Crcr {
-            getter!(data: u64; 0x0000000000000001; u8, pub ring_cycle_state);
-            setter!(data: u64; 0x0000000000000001; u8, pub set_ring_cycle_state);
+            getter!(data: u64; 0x0000000000000001;  u8, pub ring_cycle_state);
+            setter!(data: u64; 0x0000000000000001;  u8, pub set_ring_cycle_state);
 
             // RW1S
-            getter!(data: u64; 0x0000000000000002; u8, pub command_stop);
-            setter!(data: u64; 0x0000000000000002; u8, pub set_command_stop);
+            getter!(data: u64; 0x0000000000000002;  u8, pub command_stop);
+            setter!(data: u64; 0x0000000000000002;  u8, pub set_command_stop);
 
             // RW1S
-            getter!(data: u64; 0x0000000000000004; u8, pub command_abort);
-            setter!(data: u64; 0x0000000000000004; u8, pub set_command_abort);
+            getter!(data: u64; 0x0000000000000004;  u8, pub command_abort);
+            setter!(data: u64; 0x0000000000000004;  u8, pub set_command_abort);
 
             getter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, command_ring_pointer);
             setter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, set_command_ring_pointer);
 
             pub fn pointer(&self) -> usize {
-                (self.command_ring_pointer() << 6) as usize
+                (self.command_ring_pointer() as usize) << 6
             }
             pub fn set_pointer(&mut self, ptr: usize) {
-                self.set_command_ring_pointer((ptr as u64) >> 6)
+                debug_assert!(ptr & 0x3F == 0);
+                let ptr = ((ptr & 0xFFFFFFFFFFFFFFC0) >> 6) as u64;
+                self.set_command_ring_pointer(ptr);
             }
         }
 
@@ -192,10 +201,12 @@ pub mod xhci {
             setter!(data: u64; 0xFFFFFFFFFFFFFFC0; u64, set_device_context_base_address_array_pointer);
 
             pub fn pointer(&self) -> usize {
-                (self.device_context_base_address_array_pointer() << 6) as usize
+                (self.device_context_base_address_array_pointer() as usize) << 6
             }
             pub fn set_pointer(&mut self, ptr: usize) {
-                self.set_device_context_base_address_array_pointer((ptr as u64) >> 6)
+                debug_assert!(ptr & 0x3F == 0);
+                let ptr = ((ptr & 0xFFFFFFFFFFFFFFC0) >> 6) as u64;
+                self.set_device_context_base_address_array_pointer(ptr);
             }
         }
 
@@ -411,8 +422,6 @@ pub mod xhci {
     }
 
     pub struct Controller {
-        mmio_base: usize,
-        cap_regs: *mut CapabilityRegisters,
         op_regs: *mut OperationalRegisters,
         devmgr: DeviceManager,
         cr: CommandRing,
@@ -423,41 +432,40 @@ pub mod xhci {
         doorbell_zero: *mut DoorbellRegister,
     }
     impl Controller {
-        const DEVICES_SIZE: usize = 8;
+        const DEVICES_SIZE: usize = 16;
 
-        pub fn new(mmio_base: usize) -> Result<Self> {
+        /// Safety: `mmio_base` muse be a valid base address of the MMIO space.
+        pub unsafe fn new(mmio_base: usize) -> Result<Self> {
             let cap_regs = mmio_base as *mut CapabilityRegisters;
-            let max_ports = unsafe { (*cap_regs).hcsparams1.read().max_ports() };
+            let max_ports = (*cap_regs).hcsparams1.read().max_ports();
 
-            let dboff = unsafe { (*cap_regs).dboff.read().offset() };
+            let dboff = (*cap_regs).dboff.read().offset();
             let doorbell_zero = (mmio_base + dboff) as *mut DoorbellRegister;
 
-            let rtsoff = unsafe { (*cap_regs).rtsoff.read().offset() };
+            let rtsoff = (*cap_regs).rtsoff.read().offset();
             let primary_interrupter = (mmio_base + rtsoff + 0x20) as *mut InterrupterRegisterSet;
 
-            let caplength = unsafe { (*cap_regs).caplength.read() };
+            let caplength = (*cap_regs).caplength.read();
             let op_regs = (mmio_base + caplength as usize) as *mut OperationalRegisters;
 
-            if unsafe { (*op_regs).usbsts.read().host_controller_halted() == 0 } {
-                unsafe {
-                    (*op_regs)
-                        .usbcmd
-                        .modify_with(|usbcmd| usbcmd.set_run_stop(0))
-                };
+            if (*op_regs).usbsts.read().host_controller_halted() == 0 {
+                (*op_regs).usbcmd.modify_with(|usbcmd| {
+                    usbcmd.set_run_stop(0);
+                });
             }
 
             // Host controller must be halted
-            while unsafe { (*op_regs).usbsts.read().host_controller_halted() == 0 } {}
+            while (*op_regs).usbsts.read().host_controller_halted() == 0 {}
             debug!("host controller halted");
 
-            // Update the StaticMallocator's boundary with PAGESIZE
-            let page_size = unsafe { (*op_regs).pagesize.read().page_size() };
+            // Update allocation boundary with PAGESIZE
+            let page_size = (*op_regs).pagesize.read().page_size();
             MALLOC.lock().default_boundary = page_size;
 
             Self::request_hc_ownership(mmio_base, cap_regs);
 
-            // Reset controller
-            unsafe {
+            // Reset the controller
+            {
                 (*op_regs).usbcmd.modify_with(|usbcmd| {
                     usbcmd.set_host_controller_reset(1);
                 });
@@ -465,25 +473,25 @@ pub mod xhci {
                 while (*op_regs).usbsts.read().controller_not_ready() != 0 {}
             }
 
-            let max_slots = unsafe { (*cap_regs).hcsparams1.read().max_device_slots() };
-            debug!("MaxSlots: {}", max_slots);
-            assert!(Self::DEVICES_SIZE < max_slots as usize);
+            let max_slots = (*cap_regs).hcsparams1.read().max_device_slots();
             let slots = core::cmp::min(max_slots, Self::DEVICES_SIZE as u8);
-            // Set "Max Slots Enabled" field in CONFIG
-            unsafe {
-                (*op_regs).config.modify_with(|config| {
-                    config.set_max_device_slots_enabled(slots);
-                })
-            };
+            debug!("up to {} slots", slots);
 
-            let max_scratchpad_buffer_pages =
-                unsafe { (*cap_regs).hcsparams2.read().max_scratchpad_buf() };
+            // Set "Max Slots Enabled" field in CONFIG
+            (*op_regs).config.modify_with(|config| {
+                config.set_max_device_slots_enabled(slots);
+            });
+
+            let max_scratchpad_buffer_pages = (*cap_regs).hcsparams2.read().max_scratchpad_buf();
             let scratchpad_buffer_array_ptr = if max_scratchpad_buffer_pages > 0 {
                 debug!(
                     "max scratchpad buffer: {} pages",
                     max_scratchpad_buffer_pages
                 );
+
                 let mut malloc = MALLOC.lock();
+
+                #[allow(unused_unsafe)]
                 let buf_arr: &mut [MaybeUninit<*const u8>] = unsafe {
                     malloc
                         .alloc_slice_ext::<*const u8>(
@@ -494,8 +502,10 @@ pub mod xhci {
                         .ok_or(Error::NoEnoughMemory)?
                         .as_mut()
                 };
+
                 for ptr in buf_arr.iter_mut() {
-                    let buf = unsafe {
+                    #[allow(unused_unsafe)]
+                    let buf: &mut [u8] = unsafe {
                         malloc
                             .alloc(page_size, page_size, Some(page_size))
                             .ok_or(Error::NoEnoughMemory)?
@@ -503,6 +513,9 @@ pub mod xhci {
                     };
                     *ptr = MaybeUninit::new(buf.as_ptr());
                 }
+
+                // Safety: `buf_arr` has been properly initialized.
+                #[allow(unused_unsafe)]
                 let buf_arr = unsafe {
                     core::mem::transmute::<&mut [MaybeUninit<*const u8>], &mut [*const u8]>(buf_arr)
                 };
@@ -513,66 +526,65 @@ pub mod xhci {
 
             let devmgr = DeviceManager::new(
                 slots as usize,
-                unsafe { doorbell_zero.add(1) },
+                doorbell_zero.add(1),
                 scratchpad_buffer_array_ptr,
             )?;
 
             let mut dcbaap = bitmap::Dcbaap::default();
             let device_contexts = devmgr.dcbaap();
             dcbaap.set_pointer(device_contexts as usize);
-            unsafe { (*op_regs).dcbaap.write(dcbaap) };
+            (*op_regs).dcbaap.write(dcbaap);
 
             let cr = CommandRing::with_capacity(32)?;
-            // register command ring
-            unsafe {
-                (*op_regs).crcr.modify_with(|value| {
-                    value.set_ring_cycle_state(cr.cycle_bit as u8);
-                    value.set_command_stop(0);
-                    value.set_command_abort(0);
-                    value.set_pointer(cr.buffer_ptr() as usize);
-                })
-            };
+            // register the address of the Command Ring buffer
+            (*op_regs).crcr.modify_with(|value| {
+                value.set_ring_cycle_state(cr.cycle_bit as u8);
+                value.set_command_stop(0);
+                value.set_command_abort(0);
+                value.set_pointer(cr.buffer_ptr() as usize);
+            });
 
             let mut er = EventRing::with_capacity(32)?;
             er.initialize(primary_interrupter);
 
             // Enable interrupt for the primary interrupter
-            unsafe {
-                (*primary_interrupter).iman.modify_with(|iman| {
-                    iman.set_interrupt_pending(1);
-                    iman.set_interrupt_enable(1);
-                })
-            };
+            (*primary_interrupter).iman.modify_with(|iman| {
+                iman.set_interrupt_pending(1);
+                iman.set_interrupt_enable(1);
+            });
 
             // Enable interrupt for the controller
-            unsafe {
-                (*op_regs).usbcmd.modify_with(|usbcmd| {
-                    usbcmd.set_interrupter_enable(1);
-                })
-            };
+            (*op_regs).usbcmd.modify_with(|usbcmd| {
+                usbcmd.set_interrupter_enable(1);
+            });
 
-            // initialize ports
+            // allocate ports
             let ports = {
-                let port_regs_origin = ((op_regs as usize) + 0x400) as *mut PortRegisterSet;
+                let port_regs_base = ((op_regs as usize) + 0x400) as *mut PortRegisterSet;
 
-                let ports = unsafe {
+                #[allow(unused_unsafe)]
+                let ports: &mut [MaybeUninit<Port>] = unsafe {
                     MALLOC
                         .lock()
                         .alloc_slice::<Port>((max_ports + 1) as usize)
                         .ok_or(Error::NoEnoughMemory)?
                         .as_mut()
                 };
-                ports[0] = MaybeUninit::zeroed();
+
+                ports[0] = MaybeUninit::new(Port::new(0, null_mut()));
                 for port_num in 1..=max_ports {
-                    let port_regs = unsafe { port_regs_origin.add((port_num - 1) as usize) };
+                    let port_regs = port_regs_base.add((port_num - 1) as usize);
                     ports[port_num as usize] = MaybeUninit::new(Port::new(port_num, port_regs));
                 }
-                unsafe { core::mem::transmute::<&mut [MaybeUninit<Port>], &mut [Port]>(ports) }
+
+                // Safety: `ports` has been properly initialized.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    core::mem::transmute::<&mut [MaybeUninit<Port>], &mut [Port]>(ports)
+                }
             };
 
             Ok(Self {
-                mmio_base,
-                cap_regs,
                 op_regs,
                 devmgr,
                 cr,
@@ -595,10 +607,6 @@ pub mod xhci {
             while unsafe { (*self.op_regs).usbsts.read().host_controller_halted() } == 1 {}
         }
 
-        pub fn max_ports(&self) -> u8 {
-            self.max_ports
-        }
-
         fn request_hc_ownership(mmio_base: usize, cap_regs: *mut CapabilityRegisters) {
             type MmExtendedReg = MemMapped<bitmap::ExtendedRegister>;
 
@@ -606,7 +614,7 @@ pub mod xhci {
                 if step == 0 {
                     null_mut()
                 } else {
-                    unsafe { current.add(step as usize) }
+                    current.wrapping_add(step as usize)
                 }
             }
 
@@ -675,7 +683,6 @@ pub mod xhci {
             if !self.ports[port_num as usize].is_connected() {
                 return Ok(());
             }
-
             match self.addressing_port {
                 Some(_) => {
                     self.ports[port_num as usize]
@@ -828,7 +835,7 @@ pub mod xhci {
                         self.address_device(port_num, slot_id)
                     }
                     _ => {
-                        warn!("addression_port is None");
+                        warn!("addressing_port is None");
                         Err(Error::InvalidPhase)
                     }
                 },
@@ -844,7 +851,7 @@ pub mod xhci {
                     {
                         if self.addressing_port != Some(port_num) {
                             warn!(
-                                "addression_port = {:?}, but the event is on port = {}",
+                                "addressing_port = {:?}, but the event is on port = {}",
                                 self.addressing_port, port_num
                             );
                         } else {
@@ -945,6 +952,7 @@ pub mod xhci {
             match port.config_phase() {
                 PortConfigPhase::NotConnected => {
                     if port.is_connect_status_changed() {
+                        port.clear_connect_status_change();
                         self.reset_port(port_id)
                     } else {
                         trace!("skipping reset_port: port_id = {}", port_id);
@@ -1186,6 +1194,8 @@ pub mod xhci {
     }
 
     mod trb {
+        use super::{EndpointId, InputContext, SetupData};
+
         // Described in 6.4.6 of the spec.
         #[repr(u8)]
         enum TypeId {
@@ -1238,13 +1248,6 @@ pub mod xhci {
             pub fn downcast_ref<T: Trb>(&self) -> Option<&T> {
                 if self.trb_type() == T::TYPE {
                     Some(unsafe { core::mem::transmute::<&Self, &T>(self) })
-                } else {
-                    None
-                }
-            }
-            pub fn downcast_mut<T: Trb>(&mut self) -> Option<&mut T> {
-                if self.trb_type() == T::TYPE {
-                    Some(unsafe { core::mem::transmute::<&mut Self, &mut T>(self) })
                 } else {
                     None
                 }
@@ -1337,7 +1340,7 @@ pub mod xhci {
             getter!(data[3]: u32; 0x00030000;  u8, pub transfer_type);
             setter!(data[3]: u32; 0x00030000;  u8, pub set_transfer_type);
 
-            fn new(setup_data: super::SetupData, transfer_type: u8) -> Self {
+            fn new(setup_data: SetupData, transfer_type: u8) -> Self {
                 let mut setup = Self::default();
                 setup.set_request_type(setup_data.request_type);
                 setup.set_request(setup_data.request);
@@ -1347,13 +1350,13 @@ pub mod xhci {
                 setup.set_transfer_type(transfer_type);
                 setup
             }
-            pub fn new_no_data_stage(setup_data: super::SetupData) -> Self {
+            pub fn new_no_data_stage(setup_data: SetupData) -> Self {
                 Self::new(setup_data, 0)
             }
-            pub fn new_out_data_stage(setup_data: super::SetupData) -> Self {
+            pub fn new_out_data_stage(setup_data: SetupData) -> Self {
                 Self::new(setup_data, 2)
             }
-            pub fn new_in_data_stage(setup_data: super::SetupData) -> Self {
+            pub fn new_in_data_stage(setup_data: SetupData) -> Self {
                 Self::new(setup_data, 3)
             }
         }
@@ -1468,14 +1471,16 @@ pub mod xhci {
             setter!(data[3]: u32; 0x0000FC00; u8, set_trb_type);
 
             pub fn ring_segment_pointer(&self) -> usize {
-                (((self.ring_segment_pointer_hi() as u64) << 32)
-                    | ((self.ring_segment_pointer_lo() << 4) as u64)) as usize
+                let lo = (self.ring_segment_pointer_lo() as usize) << 4;
+                let hi = (self.ring_segment_pointer_hi() as usize) << 32;
+                hi | lo
             }
             pub fn set_ring_segment_pointer(&mut self, ptr: usize) {
-                let ptr = ptr as u64;
                 debug_assert!(ptr & 0xF == 0);
-                self.set_ring_segment_pointer_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
-                self.set_ring_segment_pointer_hi(((ptr & 0xFFFFFFFF00000000) >> 32) as u32);
+                let lo = ((ptr & 0x00000000FFFFFFFF) >> 4) as u32;
+                let hi = ((ptr & 0xFFFFFFFF00000000) >> 32) as u32;
+                self.set_ring_segment_pointer_lo(lo);
+                self.set_ring_segment_pointer_hi(hi);
             }
 
             pub fn new(next_ring_segment_ptr: usize) -> Self {
@@ -1528,11 +1533,11 @@ pub mod xhci {
             getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
             setter!(data[3]: u32; 0xFF000000;  u8, pub set_slot_id);
 
-            pub(super) fn input_context_ptr(&self) -> *const super::InputContext {
+            pub(super) fn input_context_ptr(&self) -> *const InputContext {
                 (((self.input_ctx_ptr_hi() as u64) << 32) | ((self.input_ctx_ptr_lo() << 4) as u64))
-                    as usize as *const super::InputContext
+                    as usize as *const InputContext
             }
-            pub(super) fn set_input_context_ptr(&mut self, ptr: *const super::InputContext) {
+            pub(super) fn set_input_context_ptr(&mut self, ptr: *const InputContext) {
                 let ptr = ptr as usize as u64;
                 debug_assert!(ptr & 0xF == 0);
                 self.set_input_ctx_ptr_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
@@ -1565,11 +1570,11 @@ pub mod xhci {
             getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
             setter!(data[3]: u32; 0xFF000000;  u8, pub set_slot_id);
 
-            pub(super) fn input_context_ptr(&self) -> *const super::InputContext {
+            pub(super) fn input_context_ptr(&self) -> *const InputContext {
                 (((self.input_ctx_ptr_hi() as u64) << 32) | ((self.input_ctx_ptr_lo() << 4) as u64))
-                    as usize as *const super::InputContext
+                    as usize as *const InputContext
             }
-            pub(super) fn set_input_context_ptr(&mut self, ptr: *const super::InputContext) {
+            pub(super) fn set_input_context_ptr(&mut self, ptr: *const InputContext) {
                 let ptr = ptr as usize as u64;
                 debug_assert!(ptr & 0xF == 0);
                 self.set_input_ctx_ptr_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
@@ -1602,11 +1607,11 @@ pub mod xhci {
             getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
             setter!(data[3]: u32; 0xFF000000;  u8, pub set_slot_id);
 
-            pub(super) fn input_context_ptr(&self) -> *const super::InputContext {
+            pub(super) fn input_context_ptr(&self) -> *const InputContext {
                 (((self.input_ctx_ptr_hi() as u64) << 32) | ((self.input_ctx_ptr_lo() << 4) as u64))
-                    as usize as *const super::InputContext
+                    as usize as *const InputContext
             }
-            pub(super) fn set_input_context_ptr(&mut self, ptr: *const super::InputContext) {
+            pub(super) fn set_input_context_ptr(&mut self, ptr: *const InputContext) {
                 let ptr = ptr as usize as u64;
                 debug_assert!(ptr & 0xF == 0);
                 self.set_input_ctx_ptr_lo(((ptr & 0x00000000FFFFFFFF) >> 4) as u32);
@@ -1635,12 +1640,16 @@ pub mod xhci {
             getter!(data[2]: u32; 0x00FFFFFF; u32, pub trb_transfer_length);
             getter!(data[2]: u32; 0xFF000000;  u8, pub completion_code);
 
-            getter!(data[3]: u32; 0x001F0000;  u8, pub endpoint_id);
+            getter!(data[3]: u32; 0x001F0000;  u8, endpoint_id_u8);
             getter!(data[3]: u32; 0xFF000000;  u8, pub slot_id);
 
             pub fn trb_pointer(&self) -> *const GenericTrb {
                 (((self.trb_pointer_hi() as usize) << 32) | (self.trb_pointer_lo() as usize))
                     as *const GenericTrb
+            }
+
+            pub fn endpoint_id(&self) -> EndpointId {
+                EndpointId::from_addr(self.endpoint_id_u8())
             }
         }
         impl Trb for TransferEvent {
@@ -1746,14 +1755,6 @@ pub mod xhci {
     #[repr(transparent)]
     #[derive(Clone, Copy)]
     struct DeviceContextIndex(usize);
-    impl DeviceContextIndex {
-        pub fn new_out(ep_num: u8) -> Self {
-            Self((ep_num as usize) * 2 + (ep_num == 0) as usize)
-        }
-        pub fn new_in(ep_num: u8) -> Self {
-            Self((ep_num as usize) * 2 + 1)
-        }
-    }
     impl From<EndpointId> for DeviceContextIndex {
         fn from(ep_id: EndpointId) -> Self {
             Self(ep_id.address() as usize)
@@ -1804,13 +1805,6 @@ pub mod xhci {
         }
     }
 
-    enum DeviceState {
-        Invalid,
-        Blank,
-        SlotAssigning,
-        SlotAssigned,
-    }
-
     use super::{
         class_driver, descriptor, request_type, EndpointConfig, EndpointId, Request, SetupData,
     };
@@ -1828,7 +1822,7 @@ pub mod xhci {
         slot_id: u8,
         speed: PortSpeed,
 
-        buf: Option<NonNull<[u8]>>,
+        buf: Buffer,
         init_phase: i8,
         num_configurations: u8,
         config_index: u8,
@@ -1841,32 +1835,8 @@ pub mod xhci {
         /// Setup Data --> class driver index
         event_waiters: ArrayMap<SetupData, usize, 4>,
 
-        /// {DataStage,StatusStage} TRB --> SetupStage TRB
-        setup_stage_map: ArrayMap<*const trb::GenericTrb, *const trb::SetupStage, 16>,
-    }
-
-    impl Device {
-        fn detach_buf(&mut self) -> NonNull<u8> {
-            let ptr = self.buf.take().expect("ownership error");
-            unsafe { NonNull::new_unchecked((*ptr.as_ptr()).as_mut_ptr()) }
-        }
-
-        /// Safety: `buf_ptr` must be a pointer which is derived from `detach_buf`.
-        unsafe fn attach_buf(&mut self, buf_ptr: NonNull<u8>) {
-            debug_assert!(self.buf.is_none());
-            let buf = NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
-                buf_ptr.as_ptr(),
-                Self::BUF_SIZE,
-            ));
-            self.buf = Some(buf);
-        }
-
-        fn slice<'a, R>(buf: &'a mut Option<NonNull<[u8]>>, range: R) -> &'a mut [u8]
-        where
-            R: core::ops::RangeBounds<usize> + core::slice::SliceIndex<[u8], Output = [u8]>,
-        {
-            unsafe { &mut buf.as_mut().expect("ownership error").as_mut()[range] }
-        }
+        /// {DataStage,StatusStage} TRB --> SetupData
+        setup_data_map: ArrayMap<*const trb::GenericTrb, SetupData, 16>,
     }
 
     impl Device {
@@ -1907,14 +1877,8 @@ pub mod xhci {
                 let init_phase_ptr = addr_of_mut!((*ptr).init_phase);
                 init_phase_ptr.write(-1);
 
-                let buf_ptr: *mut Option<NonNull<[u8]>> = addr_of_mut!((*ptr).buf);
-                {
-                    let buf: NonNull<[u8]> = MALLOC
-                        .lock()
-                        .alloc(Self::BUF_SIZE, 64, None)
-                        .ok_or(Error::NoEnoughMemory)?;
-                    buf_ptr.write(Some(buf));
-                }
+                let buf_ptr: *mut Buffer = addr_of_mut!((*ptr).buf);
+                buf_ptr.write(Buffer::new(&mut *MALLOC.lock(), Self::BUF_SIZE, 64));
 
                 let num_configurations_ptr = addr_of_mut!((*ptr).num_configurations);
                 num_configurations_ptr.write(0);
@@ -1937,8 +1901,8 @@ pub mod xhci {
                 let event_waiters_ptr = addr_of_mut!((*ptr).event_waiters);
                 ArrayMap::initialize_ptr(event_waiters_ptr);
 
-                let setup_stage_map_ptr = addr_of_mut!((*ptr).setup_stage_map);
-                ArrayMap::initialize_ptr(setup_stage_map_ptr);
+                let setup_data_map_ptr = addr_of_mut!((*ptr).setup_data_map);
+                ArrayMap::initialize_ptr(setup_data_map_ptr);
             }
             let device = &mut *ptr;
 
@@ -1993,10 +1957,8 @@ pub mod xhci {
             debug_assert_eq!(transfered_size, 8);
             trace!("initialize_phase0 on slot_id={}", self.slot_id);
 
-            debug_assert_eq!(Self::slice(&mut self.buf, ..).len(), Self::BUF_SIZE);
-            let device_desc =
-                descriptor::from_bytes::<DeviceDescriptor>(Self::slice(&mut self.buf, ..8))
-                    .unwrap();
+            debug_assert_eq!(self.buf[..].len(), Self::BUF_SIZE);
+            let device_desc = descriptor::from_bytes::<DeviceDescriptor>(&self.buf[..8]).unwrap();
             debug!("USB release = {:04x}", device_desc.usb_release as u16);
             let ep0_ctx = self
                 .input_ctx
@@ -2023,9 +1985,7 @@ pub mod xhci {
         fn initialize_phase1(&mut self, transfered_size: usize) -> Result<()> {
             trace!("initialize_phase1 on slot_id={}", self.slot_id);
             debug_assert_eq!(transfered_size, 18);
-            let device_desc =
-                descriptor::from_bytes::<DeviceDescriptor>(Self::slice(&mut self.buf, ..18))
-                    .unwrap();
+            let device_desc = descriptor::from_bytes::<DeviceDescriptor>(&self.buf[..18]).unwrap();
 
             self.num_configurations = device_desc.num_configurations;
             debug!("num_configurations = {}", self.num_configurations);
@@ -2047,18 +2007,16 @@ pub mod xhci {
 
         fn initialize_phase2(&mut self, transfered_size: usize) -> Result<()> {
             trace!("initialize_phase2 on slot_id={}", self.slot_id);
-            let buf = Self::slice(&mut self.buf, ..);
 
             // TODO: handle the case where total_length > BUF_SIZE
             assert_eq!(
-                descriptor::from_bytes::<ConfigurationDescriptor>(buf)
+                descriptor::from_bytes::<ConfigurationDescriptor>(&self.buf[..])
                     .unwrap()
                     .total_length as usize,
                 transfered_size
             );
 
-            let mut desc_itr =
-                descriptor::DescIter::new(Self::slice(&mut self.buf, ..transfered_size));
+            let mut desc_itr = descriptor::DescIter::new(&self.buf[..transfered_size]);
             while let Some(if_desc) = desc_itr.next::<InterfaceDescriptor>() {
                 let class_driver = match Self::new_class_driver(if_desc) {
                     Ok(driver) => driver,
@@ -2066,41 +2024,42 @@ pub mod xhci {
                     Err(e) => return Err(e),
                 };
 
-                self.ep_configs.clear();
                 let class_driver_idx = self.class_drivers.push(class_driver).unwrap();
+
+                let mut num_endpoints = 0;
                 debug!("if_desc.num_endpoints = {}", if_desc.num_endpoints);
-                while self.ep_configs.len() < if_desc.num_endpoints as usize {
+                while num_endpoints < if_desc.num_endpoints {
                     if let Some(ep_desc) = desc_itr.next::<EndpointDescriptor>() {
                         let conf = EndpointConfig::from(ep_desc);
                         debug!("{:?}", conf);
                         let ep_id = conf.ep_id;
                         self.ep_configs.push(conf);
+                        num_endpoints += 1;
                         self.class_driver_idxs[ep_id.number() as usize] = Some(class_driver_idx);
                     } else if let Some(hid_desc) = desc_itr.next::<HidDescriptor>() {
                         debug!("{:?}", hid_desc);
                     }
                 }
+            }
+
+            if self.class_drivers.len() == 0 {
+                warn!("No available class drivers found");
+                Ok(())
+            } else {
                 self.init_phase = 3;
 
-                let conf_desc = descriptor::from_bytes::<ConfigurationDescriptor>(Self::slice(
-                    &mut self.buf,
-                    ..,
-                ))
-                .unwrap();
+                let conf_desc =
+                    descriptor::from_bytes::<ConfigurationDescriptor>(&self.buf[..]).unwrap();
                 debug!(
                     "issuing Set Configuration: conf_val = {}",
                     conf_desc.configuration_value
                 );
                 let conf_val = conf_desc.configuration_value;
-
-                return self.set_configuration(EndpointId::DEFAULT_CONTROL_PIPE, conf_val);
+                self.set_configuration(EndpointId::DEFAULT_CONTROL_PIPE, conf_val)
             }
-
-            warn!("supported class driver not found");
-            Ok(())
         }
 
-        fn initialize_phase3(&mut self, config_value: u8) -> Result<()> {
+        fn initialize_phase3(&mut self) -> Result<()> {
             trace!("initialize_phase3 on slot_id={}", self.slot_id);
             for conf in self.ep_configs.iter() {
                 let driver_idx = self.class_driver_idxs[conf.ep_id.number() as usize];
@@ -2122,7 +2081,7 @@ pub mod xhci {
             let proto = if_desc.interface_protocol;
             match (class, sub, proto) {
                 (3, 1, 1) => {
-                    info!("keyboard");
+                    info!("keyboard found");
                     use class_driver::HidKeyboardDriver;
                     let keyboard_driver = unsafe {
                         let keyboard_driver: &mut MaybeUninit<HidKeyboardDriver> = MALLOC
@@ -2141,7 +2100,7 @@ pub mod xhci {
                     Ok(keyboard_driver)
                 }
                 (3, 1, 2) => {
-                    info!("mouse");
+                    info!("mouse found");
                     use class_driver::HidMouseDriver;
                     let mouse_driver = unsafe {
                         let mouse_driver: &mut MaybeUninit<HidMouseDriver> = MALLOC
@@ -2300,32 +2259,21 @@ pub mod xhci {
             if let Some(normal) = issuer_trb.downcast_ref::<trb::Normal>() {
                 let transfer_length = normal.trb_transfer_length() as usize - residual_bytes;
                 return self.on_interrupt_completed(
-                    EndpointId {
-                        addr: trb.endpoint_id(),
-                    },
+                    trb.endpoint_id(),
                     NonNull::new(normal.data_buffer()).expect("data buffer null"),
                     transfer_length,
                 );
             }
 
             let setup_data = match self
-                .setup_stage_map
+                .setup_data_map
                 .remove(&(issuer_trb as *const trb::GenericTrb))
             {
                 None => {
                     warn!("No Correspoinding Setup Stage TRB");
                     return Err(Error::NoCorrespondingSetupStage);
                 }
-                Some((_, setup_stage_trb)) => {
-                    let setup_stage_trb = unsafe { &*setup_stage_trb };
-                    let mut setup_data = SetupData::default();
-                    setup_data.request_type = setup_stage_trb.request_type();
-                    setup_data.request = setup_stage_trb.request();
-                    setup_data.value = setup_stage_trb.value();
-                    setup_data.index = setup_stage_trb.index();
-                    setup_data.length = setup_stage_trb.length();
-                    setup_data
-                }
+                Some((_, setup_data)) => setup_data,
             };
 
             let (buf, transfered_size) =
@@ -2333,27 +2281,20 @@ pub mod xhci {
                     let buf = NonNull::new(data_stage.data_buffer()).expect("null pointer");
                     trace!("residual_bytes = {}", residual_bytes);
                     (Some(buf), setup_data.length as usize - residual_bytes)
-                } else if let Some(status_stage) = issuer_trb.downcast_ref::<trb::StatusStage>() {
+                } else if let Some(_status_stage) = issuer_trb.downcast_ref::<trb::StatusStage>() {
                     (None, 0)
                 } else {
                     unimplemented!();
                 };
 
-            self.on_control_completed(
-                EndpointId {
-                    addr: trb.endpoint_id(),
-                },
-                setup_data,
-                buf,
-                transfered_size,
-            )
+            self.on_control_completed(trb.endpoint_id(), setup_data, buf, transfered_size)
         }
 
         fn on_control_completed(
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             transfered_size: usize,
         ) -> Result<()> {
             debug!(
@@ -2363,8 +2304,8 @@ pub mod xhci {
             );
             match self.init_phase {
                 0 => {
-                    unsafe { self.attach_buf(buf.unwrap()) };
-                    let buf = Self::slice(&mut self.buf, ..transfered_size);
+                    unsafe { self.buf.attach(buf_ptr.unwrap()) };
+                    let buf = &self.buf[..transfered_size];
                     if setup_data.request == Request::GetDescriptor as u8
                         && descriptor::from_bytes::<DeviceDescriptor>(buf).is_some()
                     {
@@ -2375,8 +2316,8 @@ pub mod xhci {
                     }
                 }
                 1 => {
-                    unsafe { self.attach_buf(buf.unwrap()) };
-                    let buf = Self::slice(&mut self.buf, ..transfered_size);
+                    unsafe { self.buf.attach(buf_ptr.unwrap()) };
+                    let buf = &self.buf[..transfered_size];
                     if setup_data.request == Request::GetDescriptor as u8
                         && descriptor::from_bytes::<DeviceDescriptor>(buf).is_some()
                     {
@@ -2387,8 +2328,8 @@ pub mod xhci {
                     }
                 }
                 2 => {
-                    unsafe { self.attach_buf(buf.unwrap()) };
-                    let buf = Self::slice(&mut self.buf, ..transfered_size);
+                    unsafe { self.buf.attach(buf_ptr.unwrap()) };
+                    let buf = &self.buf[..transfered_size];
                     if setup_data.request == Request::GetDescriptor as u8
                         && descriptor::from_bytes::<ConfigurationDescriptor>(buf).is_some()
                     {
@@ -2400,8 +2341,8 @@ pub mod xhci {
                 }
                 3 => {
                     if setup_data.request == Request::SetConfiguration as u8 {
-                        debug_assert!(buf.is_none() && self.buf.is_some());
-                        self.initialize_phase3((setup_data.value & 0xFF) as u8)
+                        debug_assert!(buf_ptr.is_none() && self.buf.own());
+                        self.initialize_phase3()
                     } else {
                         warn!("failed to go initialize_phase3");
                         Err(Error::InvalidPhase)
@@ -2413,10 +2354,12 @@ pub mod xhci {
                             .class_drivers
                             .get_mut(w_idx)
                             .expect("uninitialized class driver");
-                        match w.on_control_completed(ep_id, setup_data, buf, transfered_size)? {
-                            class_driver::TransferRequest::InterruptIn { ep_id, buf, size } => {
-                                self.interrupt_in(ep_id, buf, size)
-                            }
+                        match w.on_control_completed(ep_id, setup_data, buf_ptr, transfered_size)? {
+                            class_driver::TransferRequest::InterruptIn {
+                                ep_id,
+                                buf_ptr,
+                                size,
+                            } => self.interrupt_in(ep_id, buf_ptr, size),
                             _ => unimplemented!(),
                         }
                     }
@@ -2428,7 +2371,7 @@ pub mod xhci {
         fn on_interrupt_completed(
             &mut self,
             ep_id: EndpointId,
-            buf: NonNull<u8>,
+            buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<()> {
             trace!(
@@ -2437,9 +2380,13 @@ pub mod xhci {
             );
             if let Some(driver_idx) = self.class_driver_idxs[ep_id.number() as usize] {
                 let w = self.class_drivers.get_mut(driver_idx).unwrap();
-                match w.on_interrupt_completed(ep_id, buf, transfered_size)? {
-                    class_driver::TransferRequest::InterruptIn { ep_id, buf, size } => {
-                        self.interrupt_in(ep_id, buf, size)?;
+                match w.on_interrupt_completed(ep_id, buf_ptr, transfered_size)? {
+                    class_driver::TransferRequest::InterruptIn {
+                        ep_id,
+                        buf_ptr,
+                        size,
+                    } => {
+                        self.interrupt_in(ep_id, buf_ptr, size)?;
                     }
                     _ => unimplemented!(),
                 }
@@ -2457,7 +2404,7 @@ pub mod xhci {
             ep_id: EndpointId,
             setup_data: SetupData,
             issuer_idx: Option<usize>,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             size: usize,
         ) -> Result<()> {
             if let Some(issuer_idx) = issuer_idx {
@@ -2481,14 +2428,11 @@ pub mod xhci {
                 .as_mut()
                 .ok_or(Error::TransferRingNotSet)?;
 
-            if let Some(buf) = buf {
-                let setup_stage = trb::SetupStage::new_in_data_stage(setup_data);
-                let setup_stage_trb_ptr = tr.push(setup_stage.upcast());
-                let setup_stage_trb_ptr = setup_stage_trb_ptr
-                    .downcast_ref::<trb::SetupStage>()
-                    .unwrap() as *const trb::SetupStage;
+            if let Some(buf_ptr) = buf_ptr {
+                let setup_stage = trb::SetupStage::new_in_data_stage(setup_data.clone());
+                tr.push(setup_stage.upcast());
 
-                let mut data_stage = trb::DataStage::new_in(buf.as_ptr(), size);
+                let mut data_stage = trb::DataStage::new_in(buf_ptr.as_ptr(), size);
                 data_stage.set_interrupt_on_completion(1);
                 let data_stage_trb_ptr = tr.push(data_stage.upcast()) as *const trb::GenericTrb;
 
@@ -2498,8 +2442,8 @@ pub mod xhci {
                 let status_stage_trb_ptr = tr.push(status_stage.upcast());
                 debug!("status_stage_trb = {:p}", status_stage_trb_ptr);
 
-                self.setup_stage_map
-                    .insert(data_stage_trb_ptr, setup_stage_trb_ptr)
+                self.setup_data_map
+                    .insert(data_stage_trb_ptr, setup_data)
                     .map_err(|e| match e {
                         ArrayMapError::NoSpace => Error::TooManyWaiters,
                         ArrayMapError::SameKeyRegistered => {
@@ -2520,7 +2464,7 @@ pub mod xhci {
             ep_id: EndpointId,
             setup_data: SetupData,
             issuer_idx: Option<usize>,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             size: usize,
         ) -> Result<()> {
             if let Some(issuer_idx) = issuer_idx {
@@ -2544,14 +2488,12 @@ pub mod xhci {
                 .as_mut()
                 .ok_or(Error::TransferRingNotSet)?;
 
-            if let Some(buf) = buf {
+            if let Some(_buf_ptr) = buf_ptr {
+                let _size = size;
                 unimplemented!();
             } else {
-                let setup_stage = trb::SetupStage::new_no_data_stage(setup_data);
-                let setup_stage_trb_ptr = tr.push(setup_stage.upcast());
-                let setup_stage_trb_ptr = setup_stage_trb_ptr
-                    .downcast_ref::<trb::SetupStage>()
-                    .unwrap() as *const trb::SetupStage;
+                let setup_stage = trb::SetupStage::new_no_data_stage(setup_data.clone());
+                tr.push(setup_stage.upcast());
 
                 let mut status_stage = trb::StatusStage::default();
                 status_stage.set_direction(1);
@@ -2559,8 +2501,8 @@ pub mod xhci {
                 let status_stage_trb_ptr = tr.push(status_stage.upcast());
                 debug!("status_stage_trb = {:p}", status_stage_trb_ptr);
 
-                self.setup_stage_map
-                    .insert(status_stage_trb_ptr, setup_stage_trb_ptr)
+                self.setup_data_map
+                    .insert(status_stage_trb_ptr, setup_data)
                     .map_err(|e| match e {
                         ArrayMapError::NoSpace => Error::TooManyWaiters,
                         ArrayMapError::SameKeyRegistered => {
@@ -2576,7 +2518,7 @@ pub mod xhci {
         fn interrupt_in(
             &mut self,
             ep_id: EndpointId,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             size: usize,
         ) -> Result<()> {
             let dci = DeviceContextIndex::from(ep_id);
@@ -2585,7 +2527,7 @@ pub mod xhci {
                 .ok_or(Error::TransferRingNotSet)?;
 
             let mut normal = trb::Normal::default();
-            normal.set_data_buffer(buf.map(|ptr| ptr.as_ptr()).unwrap_or(null_mut()));
+            normal.set_data_buffer(buf_ptr.map(|ptr| ptr.as_ptr()).unwrap_or(null_mut()));
             normal.set_trb_transfer_length(size as u32);
             normal.set_interrupt_on_short_packet(1);
             normal.set_interrupt_on_completion(1);
@@ -2611,7 +2553,7 @@ pub mod xhci {
             setup_data.value = ((desc_type as u16) << 8) | (desc_index as u16);
             setup_data.index = 0;
 
-            let buf = self.detach_buf();
+            let buf = self.buf.detach();
             setup_data.length = transfer_size as u16;
             self.control_in(ep_id, setup_data, None, Some(buf), transfer_size)
         }
@@ -2894,6 +2836,8 @@ pub mod xhci {
 }
 
 mod request_type {
+    #![allow(dead_code)]
+
     #[repr(u8)]
     pub enum Recipient {
         Device = 0,
@@ -2921,7 +2865,6 @@ enum Request {
 }
 #[repr(u8)]
 enum HidRequest {
-    GetReport = 1,
     SetProtocol = 11,
 }
 
@@ -2973,13 +2916,15 @@ pub struct EndpointId {
 impl EndpointId {
     const DEFAULT_CONTROL_PIPE: EndpointId = EndpointId { addr: 1 };
 
-    pub fn new_in(ep_num: u8) -> Self {
+    pub fn from_addr(addr: u8) -> Self {
+        Self { addr }
+    }
+    pub fn from_number_in(ep_num: u8) -> Self {
         Self {
             addr: (ep_num << 1) | 1,
         }
     }
-
-    pub fn new_out(ep_num: u8) -> Self {
+    pub fn from_number_out(ep_num: u8) -> Self {
         Self {
             addr: (ep_num << 1) | (ep_num == 0) as u8,
         }
@@ -2996,10 +2941,6 @@ impl EndpointId {
     pub fn is_in(&self) -> bool {
         (self.addr & 1) == 1
     }
-
-    pub fn is_out(&self) -> bool {
-        (self.addr & 1) == 0
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -3012,7 +2953,7 @@ pub struct EndpointConfig {
 impl From<&descriptor::EndpointDescriptor> for EndpointConfig {
     fn from(ep_desc: &descriptor::EndpointDescriptor) -> Self {
         Self {
-            ep_id: EndpointId::new_in(ep_desc.number()),
+            ep_id: EndpointId::from_number_in(ep_desc.number()),
             ep_type: <EndpointType as core::convert::TryFrom<u8>>::try_from(
                 ep_desc.transfer_type(),
             )
@@ -3155,23 +3096,18 @@ mod descriptor {
     }
     impl core::fmt::Debug for HidDescriptor {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            let HidDescriptor {
-                length,
-                descriptor_type,
-                hid_release: _,
-                country_code,
-                num_descriptors,
-            } = self.clone();
             let hid_release = self.hid_release;
-            write!(f, "HidDescriptor {{ length: {}, descriptor_type: {}, hid_release: {}, country_code: {}, num_descriptors: {} }}", length, descriptor_type, hid_release, country_code, num_descriptors)
+            write!(f, "HidDescriptor {{ length: {}, descriptor_type: {}, hid_release: {}, country_code: {}, num_descriptors: {} }}", self.length, self.descriptor_type, hid_release, self.country_code, self.num_descriptors)
         }
     }
 }
 
 pub mod class_driver {
-    use super::MALLOC;
-    use super::{request_type, EndpointConfig, EndpointId, EndpointType, HidRequest, SetupData};
-    use super::{Error, Result};
+    use super::Result;
+    use super::{
+        request_type, EndpointConfig, EndpointId, EndpointType, HidRequest, SetupData, MALLOC,
+    };
+    use crate::utils::Buffer;
 
     use core::ptr::NonNull;
 
@@ -3180,12 +3116,7 @@ pub mod class_driver {
         ControlOut(SetupData),
         InterruptIn {
             ep_id: EndpointId,
-            buf: Option<NonNull<u8>>,
-            size: usize,
-        },
-        InterruptOut {
-            ep_id: EndpointId,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             size: usize,
         },
     }
@@ -3197,13 +3128,13 @@ pub mod class_driver {
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             transfered_size: usize,
         ) -> Result<TransferRequest>;
         fn on_interrupt_completed(
             &mut self,
             ep_id: EndpointId,
-            buf: NonNull<u8>,
+            buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<TransferRequest>;
     }
@@ -3214,32 +3145,8 @@ pub mod class_driver {
         ep_interrupt_in: Option<EndpointId>,
         ep_interrupt_out: Option<EndpointId>,
         init_phase: u8,
-        buf: Option<NonNull<[u8]>>,
-        prev_buf: Option<NonNull<[u8]>>,
-    }
-
-    impl HidDriver {
-        fn detach_buf(&mut self) -> NonNull<u8> {
-            let ptr = self.buf.take().expect("ownership error");
-            unsafe { NonNull::new_unchecked((*ptr.as_ptr()).as_mut_ptr()) }
-        }
-
-        /// Safety: `buf_ptr` must be a pointer which is derived from `detach_buf`.
-        unsafe fn attach_buf(&mut self, buf_ptr: NonNull<u8>) {
-            debug_assert!(self.buf.is_none());
-            let buf = NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
-                buf_ptr.as_ptr(),
-                Self::BUF_SIZE,
-            ));
-            self.buf = Some(buf);
-        }
-
-        fn slice<'a, R>(buf: &'a mut Option<NonNull<[u8]>>, range: R) -> &'a mut [u8]
-        where
-            R: core::ops::RangeBounds<usize> + core::slice::SliceIndex<[u8], Output = [u8]>,
-        {
-            unsafe { &mut buf.as_mut().expect("ownership error").as_mut()[range] }
-        }
+        buf: Buffer,
+        prev_buf: Buffer,
     }
 
     impl HidDriver {
@@ -3247,22 +3154,13 @@ pub mod class_driver {
 
         pub fn new(interface_idx: u8, in_packet_size: usize) -> Result<Self> {
             let mut malloc = MALLOC.lock();
-
-            let buf = malloc
-                .alloc(Self::BUF_SIZE, 64, None)
-                .ok_or(Error::NoEnoughMemory)?;
-
-            let prev_buf = malloc
-                .alloc(Self::BUF_SIZE, 64, None)
-                .ok_or(Error::NoEnoughMemory)?;
-
             Ok(Self {
                 interface_idx,
                 in_packet_size,
                 ep_interrupt_in: None,
                 ep_interrupt_out: None,
-                buf: Some(buf),
-                prev_buf: Some(prev_buf),
+                buf: Buffer::new(&mut *malloc, Self::BUF_SIZE, 64),
+                prev_buf: Buffer::new(&mut *malloc, Self::BUF_SIZE, 64),
                 init_phase: 0,
             })
         }
@@ -3274,9 +3172,10 @@ pub mod class_driver {
         }
 
         pub fn buffer(&mut self) -> &mut [u8] {
-            Self::slice(&mut self.prev_buf, ..)
+            &mut self.prev_buf[..]
         }
     }
+
     impl Driver for HidDriver {
         fn set_endpoint(&mut self, config: &EndpointConfig) -> Result<()> {
             if config.ep_type == EndpointType::Interrupt {
@@ -3291,24 +3190,25 @@ pub mod class_driver {
 
         fn on_control_completed(
             &mut self,
-            ep_id: EndpointId,
-            setup_data: SetupData,
-            buf: Option<NonNull<u8>>,
+            _ep_id: EndpointId,
+            _setup_data: SetupData,
+            buf_ptr: Option<NonNull<u8>>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
-            debug!(
+            trace!(
                 "HidDriver::on_control_completed: phase = {}, transfered_size = {}",
-                self.init_phase, transfered_size
+                self.init_phase,
+                transfered_size
             );
 
             match self.init_phase {
                 1 => {
-                    debug_assert!(buf.is_none());
+                    debug_assert!(buf_ptr.is_none());
                     self.init_phase = 2;
-                    let buf = self.detach_buf();
+                    let buf_ptr = self.buf.detach();
                     Ok(TransferRequest::InterruptIn {
-                        ep_id: self.ep_interrupt_in.expect("Endpoint Not Initialized"),
-                        buf: Some(buf),
+                        ep_id: self.ep_interrupt_in.expect("Endpoint not initialized"),
+                        buf_ptr: Some(buf_ptr),
                         size: self.in_packet_size,
                     })
                 }
@@ -3319,15 +3219,19 @@ pub mod class_driver {
         fn on_interrupt_completed(
             &mut self,
             ep_id: EndpointId,
-            buf: NonNull<u8>,
+            buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
             if ep_id.is_in() {
-                unsafe { self.attach_buf(buf) };
+                debug_assert_eq!(transfered_size, self.in_packet_size);
+
+                unsafe { self.buf.attach(buf_ptr) };
                 self.swap_buffer();
+                let buf_ptr = self.buf.detach();
+
                 Ok(TransferRequest::InterruptIn {
-                    ep_id: self.ep_interrupt_in.expect("Endpoint Not Initialized"),
-                    buf: Some(buf),
+                    ep_id: self.ep_interrupt_in.expect("Endpoint not initialized"),
+                    buf_ptr: Some(buf_ptr),
                     size: self.in_packet_size,
                 })
             } else {
@@ -3350,9 +3254,6 @@ pub mod class_driver {
         }
     }
 
-    use crate::sync::spin::SpinMutex;
-    static MOUSE_CURSOR_POS: SpinMutex<(isize, isize)> = SpinMutex::new("mouse_cursor", (0, 0));
-
     pub struct HidMouseDriver {
         hid_driver: HidDriver,
     }
@@ -3371,58 +3272,72 @@ pub mod class_driver {
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
             self.hid_driver
-                .on_control_completed(ep_id, setup_data, buf, transfered_size)
+                .on_control_completed(ep_id, setup_data, buf_ptr, transfered_size)
         }
         fn on_interrupt_completed(
             &mut self,
             ep_id: EndpointId,
-            buf: NonNull<u8>,
+            buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
             let req = self
                 .hid_driver
-                .on_interrupt_completed(ep_id, buf, transfered_size)?;
+                .on_interrupt_completed(ep_id, buf_ptr, transfered_size)?;
 
-            let first = self.hid_driver.buffer()[0];
-            let displacement_x = self.hid_driver.buffer()[1];
-            let displacement_y = self.hid_driver.buffer()[2];
+            // FIXME
+            {
+                use crate::sync::spin::SpinMutex;
+                static MOUSE_CURSOR_POS: SpinMutex<(isize, isize)> =
+                    SpinMutex::new("mouse_cursor", (0, 0));
 
-            let displacement_x = if displacement_x >= 128 {
-                (displacement_x as isize) - 256
-            } else {
-                displacement_x as isize
-            };
-            let displacement_y = if displacement_y >= 128 {
-                (displacement_y as isize) - 256
-            } else {
-                displacement_y as isize
-            };
+                let button = self.hid_driver.buffer()[0];
+                let dx = self.hid_driver.buffer()[1];
+                let dy = self.hid_driver.buffer()[2];
 
-            info!(
-                "mouse moved: {}, dx: {:3}, dy: {:3}",
-                first, displacement_x, displacement_y
-            );
+                let dx = if dx >= 128 {
+                    (dx as isize) - 256
+                } else {
+                    dx as isize
+                };
+                let dy = if dy >= 128 {
+                    (dy as isize) - 256
+                } else {
+                    dy as isize
+                };
 
-            use crate::global::lock_frame_buffer;
-            use crate::graphics::{Color, Render};
-            let mut cursor = MOUSE_CURSOR_POS.lock();
+                use crate::global::lock_frame_buffer;
+                use crate::graphics::{Color, Render};
 
-            let (mut x, mut y) = *cursor;
-            lock_frame_buffer(|frame_buffer| {
-                frame_buffer.draw_filled_rect(x, y, 32, 32, Color { r: 0, g: 0, b: 0 })
-            });
+                let mut cursor = MOUSE_CURSOR_POS.lock();
+                let (mut x, mut y) = *cursor;
 
-            x += displacement_x;
-            y += displacement_y;
+                if button == 0 {
+                    lock_frame_buffer(|frame_buffer| {
+                        frame_buffer.draw_filled_rect(x, y, 32, 32, Color::BLACK)
+                    });
+                }
 
-            lock_frame_buffer(|frame_buffer| {
-                frame_buffer.draw_filled_rect(x, y, 32, 32, Color { r: 255, g: 0, b: 0 })
-            });
-            *cursor = (x, y);
+                x += dx;
+                y += dy;
+                println!("mouse: button:{}, dx: {:3}, dy: {:3}", button, dx, dy);
+
+                let color = if button & 0b01 != 0 {
+                    Color { r: 0, g: 255, b: 0 }
+                } else if button & 0b10 != 0 {
+                    Color { r: 0, g: 0, b: 255 }
+                } else {
+                    Color { r: 255, g: 0, b: 0 }
+                };
+
+                lock_frame_buffer(|frame_buffer| {
+                    frame_buffer.draw_filled_rect(x, y, 32, 32, color)
+                });
+                *cursor = (x, y);
+            }
 
             Ok(req)
         }
@@ -3433,12 +3348,102 @@ pub mod class_driver {
 
     pub struct HidKeyboardDriver {
         hid_driver: HidDriver,
+        prev: [u8; 6],
     }
     impl HidKeyboardDriver {
         pub fn new(interface_idx: u8) -> Result<Self> {
             Ok(Self {
                 hid_driver: HidDriver::new(interface_idx, 8)?,
+                prev: [0; 6],
             })
+        }
+        fn key2ascii(shift: bool, keycode: u8) -> Option<char> {
+            match (shift, keycode) {
+                (false, 0x04) => Some('a'),
+                (false, 0x05) => Some('b'),
+                (false, 0x06) => Some('c'),
+                (false, 0x07) => Some('d'),
+                (false, 0x08) => Some('e'),
+                (false, 0x09) => Some('f'),
+                (false, 0x0a) => Some('g'),
+                (false, 0x0b) => Some('h'),
+                (false, 0x0c) => Some('i'),
+                (false, 0x0d) => Some('j'),
+                (false, 0x0e) => Some('k'),
+                (false, 0x0f) => Some('l'),
+                (false, 0x10) => Some('m'),
+                (false, 0x11) => Some('n'),
+                (false, 0x12) => Some('o'),
+                (false, 0x13) => Some('p'),
+                (false, 0x14) => Some('q'),
+                (false, 0x15) => Some('r'),
+                (false, 0x16) => Some('s'),
+                (false, 0x17) => Some('t'),
+                (false, 0x18) => Some('u'),
+                (false, 0x19) => Some('v'),
+                (false, 0x1a) => Some('w'),
+                (false, 0x1b) => Some('x'),
+                (false, 0x1c) => Some('y'),
+                (false, 0x1d) => Some('z'),
+                (true, 0x04) => Some('A'),
+                (true, 0x05) => Some('B'),
+                (true, 0x06) => Some('C'),
+                (true, 0x07) => Some('D'),
+                (true, 0x08) => Some('E'),
+                (true, 0x09) => Some('F'),
+                (true, 0x0a) => Some('G'),
+                (true, 0x0b) => Some('H'),
+                (true, 0x0c) => Some('I'),
+                (true, 0x0d) => Some('J'),
+                (true, 0x0e) => Some('K'),
+                (true, 0x0f) => Some('L'),
+                (true, 0x10) => Some('M'),
+                (true, 0x11) => Some('N'),
+                (true, 0x12) => Some('O'),
+                (true, 0x13) => Some('P'),
+                (true, 0x14) => Some('Q'),
+                (true, 0x15) => Some('R'),
+                (true, 0x16) => Some('S'),
+                (true, 0x17) => Some('T'),
+                (true, 0x18) => Some('U'),
+                (true, 0x19) => Some('V'),
+                (true, 0x1a) => Some('W'),
+                (true, 0x1b) => Some('X'),
+                (true, 0x1c) => Some('Y'),
+                (true, 0x1d) => Some('Z'),
+
+                (false, 0x1E) => Some('1'),
+                (false, 0x1F) => Some('2'),
+                (false, 0x20) => Some('3'),
+                (false, 0x21) => Some('4'),
+                (false, 0x22) => Some('5'),
+                (false, 0x23) => Some('6'),
+                (false, 0x24) => Some('7'),
+                (false, 0x25) => Some('8'),
+                (false, 0x26) => Some('9'),
+                (false, 0x27) => Some('0'),
+
+                (true, 0x1E) => Some('!'),
+                (true, 0x1F) => Some('@'),
+                (true, 0x20) => Some('#'),
+                (true, 0x21) => Some('$'),
+                (true, 0x22) => Some('%'),
+                (true, 0x23) => Some('^'),
+                (true, 0x24) => Some('&'),
+                (true, 0x25) => Some('*'),
+                (true, 0x26) => Some('('),
+                (true, 0x27) => Some(')'),
+
+                (false, 0x36) => Some(','),
+                (false, 0x37) => Some('.'),
+
+                (false, 0x2A) => Some('\x08'), // backspace
+
+                (false, 0x2C) => Some(' '),
+                (false, 0x28) => Some('\n'),
+
+                _ => None,
+            }
         }
     }
     impl Driver for HidKeyboardDriver {
@@ -3449,28 +3454,45 @@ pub mod class_driver {
             &mut self,
             ep_id: EndpointId,
             setup_data: SetupData,
-            buf: Option<NonNull<u8>>,
+            buf_ptr: Option<NonNull<u8>>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
             self.hid_driver
-                .on_control_completed(ep_id, setup_data, buf, transfered_size)
+                .on_control_completed(ep_id, setup_data, buf_ptr, transfered_size)
         }
         fn on_interrupt_completed(
             &mut self,
             ep_id: EndpointId,
-            buf: NonNull<u8>,
+            buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
             let req = self
                 .hid_driver
-                .on_interrupt_completed(ep_id, buf, transfered_size)?;
+                .on_interrupt_completed(ep_id, buf_ptr, transfered_size)?;
 
-            for i in 2..8 {
-                let key = self.hid_driver.buffer()[i];
-                if key == 0 {
-                    continue;
+            // FIXME
+            {
+                const SHIFT_MASK: u8 = 0b00100010;
+                let modifier = self.hid_driver.buffer()[0];
+                let shift = modifier & SHIFT_MASK != 0;
+                for i in 2..8 {
+                    let key = self.hid_driver.buffer()[i];
+                    if key == 0 || self.prev.contains(&key) {
+                        continue;
+                    }
+
+                    let ch = Self::key2ascii(shift, key);
+                    println!(
+                        "key down: {:?} (mod: {:02x}, key: {:02x})",
+                        ch, modifier, key
+                    );
                 }
-                debug!("key pushed = {}", key);
+                for key in self.prev.iter() {
+                    if !self.hid_driver.buffer()[2..8].contains(&key) {
+                        println!("  key up: {:02x}", key);
+                    }
+                }
+                self.prev.copy_from_slice(&self.hid_driver.buffer()[2..8]);
             }
 
             Ok(req)

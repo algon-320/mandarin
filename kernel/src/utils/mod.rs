@@ -1,4 +1,5 @@
 mod array_map;
+mod buffer;
 mod fixed_vec;
 mod static_malloc;
 
@@ -9,5 +10,6 @@ mod bitfield;
 mod eq_match;
 
 pub use array_map::*;
+pub use buffer::*;
 pub use fixed_vec::*;
 pub use static_malloc::*;

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use core::mem::MaybeUninit;
 use core::mem::{align_of, size_of};
 use core::ptr::{slice_from_raw_parts_mut, NonNull};

@@ -61,6 +61,13 @@ impl Console {
         self.cells[(end - self.columns)..end].fill(Cell::DEFAULT);
     }
 
+    fn move_cursor_backward(&mut self) {
+        if self.cursor.x > 0 {
+            self.cursor.x -= 1;
+        } else {
+            // TODO
+        }
+    }
     fn move_cursor_forward(&mut self) {
         self.cursor.x += 1;
         if self.cursor.x == self.columns {
@@ -86,6 +93,14 @@ impl Console {
         match ch {
             '\n' => {
                 self.move_cursor_newline();
+            }
+            '\x08' => {
+                self.move_cursor_backward();
+                let idx = self.cursor.y * self.columns + self.cursor.x;
+                self.cells[idx] = Cell {
+                    ch: None,
+                    attr: self.attr,
+                };
             }
             ch => {
                 let idx = self.cursor.y * self.columns + self.cursor.x;

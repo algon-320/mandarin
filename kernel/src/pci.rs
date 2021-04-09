@@ -1,16 +1,12 @@
 #[derive(Debug)]
 pub enum Error {
     Full,
-    IndexOutOfRange,
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Full => {
-                write!(f, "More than 32 devices found")
-            }
-            Self::IndexOutOfRange => {
-                write!(f, "Index out of range")
+                write!(f, "More than {} devices found", MAX_DEVICES)
             }
         }
     }
@@ -130,9 +126,9 @@ impl Device {
         write_data(value);
     }
 
-    pub fn read_bar(&self, bar_idx: u8) -> Result<u64> {
+    pub fn read_bar(&self, bar_idx: u8) -> Option<u64> {
         if bar_idx >= 6 {
-            return Err(Error::IndexOutOfRange);
+            return None;
         }
 
         const BAR_OFFSET: u8 = 4;
@@ -140,16 +136,16 @@ impl Device {
 
         // 32-bit address
         if bar & 0b100 == 0 {
-            return Ok(bar as u64);
+            return Some(bar as u64);
         }
 
         // 64-bit address
         if bar_idx >= 5 {
-            return Err(Error::IndexOutOfRange);
+            return None;
         }
 
         let bar_upper = self.read_register(BAR_OFFSET + bar_idx + 1);
-        Ok(((bar_upper as u64) << 32) | bar as u64)
+        Some(((bar_upper as u64) << 32) | bar as u64)
     }
 }
 impl core::fmt::Debug for Device {
@@ -167,7 +163,8 @@ impl core::fmt::Debug for Device {
 }
 
 use crate::utils::FixedVec;
-static mut DEVICES: FixedVec<Device, 32> = FixedVec::new();
+const MAX_DEVICES: usize = 32;
+static mut DEVICES: FixedVec<Device, MAX_DEVICES> = FixedVec::new();
 pub fn devices() -> &'static [Device] {
     unsafe { DEVICES.as_slice() }
 }

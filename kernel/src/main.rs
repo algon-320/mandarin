@@ -19,8 +19,6 @@ mod sync;
 mod usb;
 mod x86;
 
-use crate::graphics::{font, Color, FrameBuffer};
-
 fn switch_ehci_to_xhci(xhc_dev: &pci::Device) {
     trace!("switch_ehci_to_xhci");
 
@@ -48,17 +46,19 @@ fn switch_ehci_to_xhci(xhc_dev: &pci::Device) {
     );
 }
 
+use crate::graphics::FrameBuffer;
+
 #[no_mangle]
 pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
     let w = frame_buffer.width();
     let h = frame_buffer.height();
     global::init_frame_buffer(frame_buffer);
 
-    use graphics::Render;
+    use graphics::{Color, Render};
     global::lock_frame_buffer(|fb| fb.draw_filled_rect(0, 0, w, h, Color::BLACK));
 
-    use font::Font;
-    let (cw, ch) = font::ShinonomeFont.char_size(' ');
+    use graphics::font::{Font, ShinonomeFont};
+    let (cw, ch) = ShinonomeFont.char_size(' ');
     let columns = (w / cw) as usize;
     let lines = (h / ch) as usize;
     global::init_console(columns, lines);
@@ -67,7 +67,8 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
     test_main();
 
     print!(
-        r" __  __                 _            _          ___  ____  
+        r"
+ __  __                 _            _          ___  ____
 |  \/  | __ _ _ __   __| | __ _ _ __(_)_ __    / _ \/ ___| 
 | |\/| |/ _` | '_ \ / _` |/ _` | '__| | '_ \  | | | \___ \ 
 | |  | | (_| | | | | (_| | (_| | |  | | | | | | |_| |___) |
@@ -76,8 +77,7 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
     );
     println!();
 
-    let scan_result = unsafe { pci::scan_all_buses() };
-    debug!("scan_all_buses: {:?}", scan_result);
+    unsafe { pci::scan_all_buses() }.expect("Failed to scan PCI bus");
 
     for dev in pci::devices().iter() {
         trace!("{:?}", dev);
@@ -107,8 +107,9 @@ pub extern "C" fn kernel_main(frame_buffer: FrameBuffer) {
             let mmio_base = (xhc_bar.unwrap() & !0x0F) as usize;
             debug!("MMIO base: {:8x}", mmio_base);
 
-            let mut controller = usb::xhci::Controller::new(mmio_base).unwrap();
+            let mut controller = unsafe { usb::xhci::Controller::new(mmio_base).unwrap() };
             debug!("xHC initialized");
+
             controller.run();
             controller.configure_ports();
 
