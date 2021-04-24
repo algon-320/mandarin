@@ -78,24 +78,23 @@ pub trait Render {
 
 impl Render for FrameBuffer {
     fn draw_pixel(&mut self, x: isize, y: isize, Color { r, g, b }: Color) {
-        // check is valid point
         {
             let w = self.resolution_horizontal as isize;
             let h = self.resolution_vertical as isize;
-            if !(0 <= x && x < w && 0 <= y && y < h) {
-                return;
-            }
+            debug_assert!(0 <= x && x < w && 0 <= y && y < h);
         }
-        let (x, y) = (x as usize, y as usize);
 
         debug_assert!(!self.buffer.is_null());
-        let idx = self.stride as usize * y + x;
-        let p = unsafe { self.buffer.add(4 * idx) };
+
         let data: [u8; 4] = match self.format {
             PixelFormat::Rgb => [r, g, b, 0],
             PixelFormat::Bgr => [b, g, r, 0],
             _ => unimplemented!(),
         };
+
+        let (x, y) = (x as usize, y as usize);
+        let idx = self.stride as usize * y + x;
+        let p = unsafe { self.buffer.add(4 * idx) };
         for (i, &v) in data.iter().enumerate() {
             unsafe { p.add(i).write_volatile(v) };
         }
