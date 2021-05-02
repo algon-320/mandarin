@@ -81,7 +81,9 @@ impl Render for FrameBuffer {
         {
             let w = self.resolution_horizontal as isize;
             let h = self.resolution_vertical as isize;
-            debug_assert!(0 <= x && x < w && 0 <= y && y < h);
+            if !(0 <= x && x < w && 0 <= y && y < h) {
+                return;
+            }
         }
 
         debug_assert!(!self.buffer.is_null());

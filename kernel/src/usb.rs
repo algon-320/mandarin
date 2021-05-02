@@ -3321,9 +3321,9 @@ pub mod class_driver {
                     });
                 }
 
-                x += dx;
-                y += dy;
-                println!("mouse: button:{}, dx: {:3}, dy: {:3}", button, dx, dy);
+                x = x.wrapping_add(dx);
+                y = y.wrapping_add(dy);
+                debug!("mouse: button:{}, dx: {:3}, dy: {:3}", button, dx, dy);
 
                 let color = if button & 0b01 != 0 {
                     Color { r: 0, g: 255, b: 0 }
