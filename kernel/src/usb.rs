@@ -11,6 +11,7 @@ pub enum Error {
     DeviceAlreadyAllocated,
     TransferRingNotSet,
     TransferFailed { slot_id: u8 },
+    CommandCompletionFailed { slot_id: u8 },
     NoCorrespondingSetupStage,
     NoWaiter,
     TooManyWaiters,
@@ -777,6 +778,22 @@ pub mod xhci {
                 .expect("TRB is not a TransferEvent");
 
             let slot_id = trb.slot_id();
+
+            if !(trb.completion_code() == 1 /* Success */ ||
+                 trb.completion_code() == 13/* Short Packet */)
+            {
+                warn!(
+                    "on_transfer_event_received: invalid trb = {:?} (completion code: {})",
+                    trb.upcast(),
+                    trb.completion_code(),
+                );
+                let issuer_trb = unsafe { &*trb.trb_pointer() };
+                debug!("issuer = {:?}", issuer_trb);
+                return Err(Error::TransferFailed {
+                    slot_id: trb.slot_id(),
+                });
+            }
+
             trace!("TransferEvent: slot_id = {}", slot_id);
 
             let dev = self
@@ -819,6 +836,13 @@ pub mod xhci {
 
             let issuer_type = unsafe { (*trb.command_trb_pointer()).trb_type() };
             let slot_id = trb.slot_id();
+
+            if trb.completion_code() != 1 {
+                return Err(Error::CommandCompletionFailed {
+                    slot_id: trb.slot_id(),
+                });
+            }
+
             trace!(
                 "CommandCompletionEvent: slot_id = {}, issuer trb_type = {}, code = {}",
                 slot_id,
@@ -2236,18 +2260,6 @@ pub mod xhci {
         }
 
         fn on_transfer_event_received(&mut self, trb: &trb::TransferEvent) -> Result<()> {
-            if !(trb.completion_code() == 1 /* Success */ || trb.completion_code() == 13/* Short Packet*/)
-            {
-                warn!(
-                    "on_transfer_event_received: invalid trb = {:?} (completion code: {})",
-                    trb.upcast(),
-                    trb.completion_code(),
-                );
-                return Err(Error::TransferFailed {
-                    slot_id: trb.slot_id(),
-                });
-            }
-
             trace!(
                 "device::on_transfer_event_received: issuer TRB = {:p}",
                 trb.trb_pointer()
