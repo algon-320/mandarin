@@ -3223,7 +3223,7 @@ pub mod class_driver {
             transfered_size: usize,
         ) -> Result<TransferRequest> {
             if ep_id.is_in() {
-                debug_assert_eq!(transfered_size, self.in_packet_size);
+                debug_assert!(transfered_size <= self.in_packet_size);
 
                 unsafe { self.buf.attach(buf_ptr) };
                 self.swap_buffer();
@@ -3260,7 +3260,7 @@ pub mod class_driver {
     impl HidMouseDriver {
         pub fn new(interface_idx: u8) -> Result<Self> {
             Ok(Self {
-                hid_driver: HidDriver::new(interface_idx, 3)?,
+                hid_driver: HidDriver::new(interface_idx, 8)?,
             })
         }
     }
