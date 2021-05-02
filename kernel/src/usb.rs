@@ -2160,7 +2160,8 @@ pub mod xhci {
             slot_ctx.set_context_entries(31);
 
             for i in 0..self.ep_configs.len() {
-                let ep_dci = DeviceContextIndex::from(self.ep_configs.get(i).unwrap().ep_id);
+                let config = self.ep_configs.get(i).unwrap();
+                let ep_dci = DeviceContextIndex::from(config.ep_id);
                 let tr_buf_ptr = self.alloc_transfer_ring(ep_dci, 32)?.buffer_ptr();
 
                 let config = self.ep_configs.get(i).unwrap();
@@ -2169,15 +2170,19 @@ pub mod xhci {
                 match config.ep_type {
                     EndpointType::Control => {
                         ep_ctx.set_endpoint_type(4);
+                        debug!("ep_id = {:?}: Control Endpoint", config.ep_id);
                     }
                     EndpointType::Isochronous => {
                         ep_ctx.set_endpoint_type(if config.ep_id.is_in() { 5 } else { 1 });
+                        debug!("ep_id = {:?}: Isoch Endpoint", config.ep_id);
                     }
                     EndpointType::Bulk => {
                         ep_ctx.set_endpoint_type(if config.ep_id.is_in() { 6 } else { 2 });
+                        debug!("ep_id = {:?}: Bulk Endpoint", config.ep_id);
                     }
                     EndpointType::Interrupt => {
                         ep_ctx.set_endpoint_type(if config.ep_id.is_in() { 7 } else { 3 });
+                        debug!("ep_id = {:?}: Interrupt Endpoint", config.ep_id);
                     }
                 }
 
@@ -2215,7 +2220,7 @@ pub mod xhci {
 
         fn on_endpoints_configured(&mut self) -> Result<()> {
             for idx in 0..self.class_drivers.len() {
-                let class_driver = self.class_drivers.get_mut(idx).expect("index out of range");
+                let class_driver = self.class_drivers.get_mut(idx).unwrap();
                 match class_driver.on_endpoints_configured()? {
                     class_driver::TransferRequest::NoOp => continue,
                     class_driver::TransferRequest::ControlOut(setup_data) => {
@@ -2402,6 +2407,8 @@ pub mod xhci {
                     }
                     _ => unimplemented!(),
                 }
+            } else {
+                trace!("class driver not found");
             }
             Ok(())
         }
@@ -3192,8 +3199,14 @@ pub mod class_driver {
         fn set_endpoint(&mut self, config: &EndpointConfig) -> Result<()> {
             if config.ep_type == EndpointType::Interrupt {
                 if config.ep_id.is_in() {
+                    if self.ep_interrupt_in.is_some() {
+                        warn!("ep_interrupt_in overwritten");
+                    }
                     self.ep_interrupt_in = Some(config.ep_id);
                 } else {
+                    if self.ep_interrupt_out.is_some() {
+                        warn!("ep_interrupt_out overwritten");
+                    }
                     self.ep_interrupt_out = Some(config.ep_id);
                 }
             }
@@ -3296,6 +3309,7 @@ pub mod class_driver {
             buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
+            trace!("HidMouseDriver::on_interrupt_completed ep_id = {:?}", ep_id);
             let req = self
                 .hid_driver
                 .on_interrupt_completed(ep_id, buf_ptr, transfered_size)?;
@@ -3478,6 +3492,10 @@ pub mod class_driver {
             buf_ptr: NonNull<u8>,
             transfered_size: usize,
         ) -> Result<TransferRequest> {
+            trace!(
+                "HidKeyboardDriver::on_interrupt_completed ep_id = {:?}",
+                ep_id
+            );
             let req = self
                 .hid_driver
                 .on_interrupt_completed(ep_id, buf_ptr, transfered_size)?;
